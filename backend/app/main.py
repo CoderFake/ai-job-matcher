@@ -24,6 +24,8 @@ from app.api.router import api_router
 from app.core.config import get_model_config, configure_gpu, check_disk_space, get_fallback_model_path
 from app.core.settings import settings
 from app.core.logging import setup_logging
+from dotenv import load_dotenv
+load_dotenv()
 
 # Thiết lập logging
 setup_logging()
@@ -35,21 +37,40 @@ ENABLE_DOCS = os.getenv("ENABLE_DOCS", "False").lower() in ("true", "1", "t")
 if os.getenv("DEBUG", "False").lower() in ("true", "1", "t"):
     ENABLE_DOCS = True
 
+
 def create_application() -> FastAPI:
     """Tạo ứng dụng FastAPI"""
 
+    # Tạo ứng dụng với các tùy chọn cơ bản
     application = FastAPI(
         title=settings.PROJECT_NAME,
         description=settings.PROJECT_DESCRIPTION,
         version=settings.VERSION,
-        # Thiết lập docs_url và redoc_url dựa vào biến môi trường
-        docs_url="/api/docs" if ENABLE_DOCS else None,
-        redoc_url="/api/redoc" if ENABLE_DOCS else None,
+        # Đặt các đường dẫn tài liệu luôn là None để chúng ta có thể tùy chỉnh
+        docs_url=None,
+        redoc_url=None,
+        # OpenAPI URL phải được đặt cho tài liệu hoạt động
         openapi_url="/api/openapi.json" if ENABLE_DOCS else None,
     )
 
-    # Tùy chỉnh OpenAPI schema nếu bật docs
+    # Thêm middleware GZip cho nén dữ liệu
+    application.add_middleware(GZipMiddleware, minimum_size=1000)
+
+    # Thêm middleware CORS
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Đăng ký các routes API
+    application.include_router(api_router, prefix=settings.API_PREFIX)
+
+    # Tùy chỉnh OpenAPI schema và định nghĩa các trang tài liệu API
     if ENABLE_DOCS:
+        # Tùy chỉnh schema OpenAPI
         def custom_openapi():
             if application.openapi_schema:
                 return application.openapi_schema
@@ -90,6 +111,9 @@ def create_application() -> FastAPI:
             ]
 
             # Thêm bảo mật (nếu cần)
+            if "components" not in openapi_schema:
+                openapi_schema["components"] = {}
+
             openapi_schema["components"]["securitySchemes"] = {
                 "APIKeyHeader": {
                     "type": "apiKey",
@@ -101,27 +125,13 @@ def create_application() -> FastAPI:
             application.openapi_schema = openapi_schema
             return application.openapi_schema
 
+        # Gán function custom_openapi
         application.openapi = custom_openapi
 
-    # Thêm middleware GZip cho nén dữ liệu
-    application.add_middleware(GZipMiddleware, minimum_size=1000)
-
-    # Thêm middleware CORS
-    application.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # Đăng ký các routes API
-    application.include_router(api_router, prefix=settings.API_PREFIX)
-
-    # Tạo custom swagger UI docs nếu bật docs
-    if ENABLE_DOCS:
+        # Định nghĩa các trang tài liệu API tùy chỉnh
         @application.get("/api/docs", include_in_schema=False)
         async def custom_swagger_ui_html():
+            logger.info("Swagger UI endpoint được gọi")
             return get_swagger_ui_html(
                 openapi_url="/api/openapi.json",
                 title=f"{settings.PROJECT_NAME} - Swagger UI",
@@ -133,6 +143,7 @@ def create_application() -> FastAPI:
 
         @application.get("/api/redoc", include_in_schema=False)
         async def custom_redoc_html():
+            logger.info("ReDoc endpoint được gọi")
             return get_redoc_html(
                 openapi_url="/api/openapi.json",
                 title=f"{settings.PROJECT_NAME} - ReDoc",
@@ -140,10 +151,31 @@ def create_application() -> FastAPI:
                 redoc_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
             )
 
-    # Cải thiện xử lý lỗi và quản lý tài nguyên trong main.py
+        @application.get("/api/docs/oauth2-redirect", include_in_schema=False)
+        async def oauth2_redirect():
+            return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>OAuth2 Redirect</title>
+                <script>
+                    window.onload = function() {
+                        const urlParams = new URLSearchParams(window.location.search);
+                        window.opener.postMessage({
+                            type: "oauth2",
+                            code: urlParams.get("code"),
+                            state: urlParams.get("state")
+                        }, window.location.origin);
+                        window.close();
+                    }
+                </script>
+            </head>
+            <body>Redirecting...</body>
+            </html>
+            """
 
     # Trình xử lý lỗi chung nâng cao
-    @app.exception_handler(HTTPException)
+    @application.exception_handler(HTTPException)
     async def http_exception_handler(request, exc):
         """Xử lý lỗi HTTP một cách chi tiết hơn"""
         # Ghi log với thông tin bổ sung
@@ -172,7 +204,7 @@ def create_application() -> FastAPI:
             },
         )
 
-    @app.exception_handler(Exception)
+    @application.exception_handler(Exception)
     async def general_exception_handler(request, exc):
         """Xử lý các loại lỗi không mong đợi"""
         # Ghi log chi tiết với traceback
@@ -227,7 +259,7 @@ def create_application() -> FastAPI:
         )
 
     # Cải thiện middleware ghi log yêu cầu
-    @app.middleware("http")
+    @application.middleware("http")
     async def log_and_process_request(request: Request, call_next):
         """
         Middleware ghi log và xử lý yêu cầu với nhiều thông tin hơn và theo dõi hiệu suất
@@ -284,154 +316,8 @@ def create_application() -> FastAPI:
             # Tiếp tục nâng lỗi
             raise
 
-    # Cải thiện sự kiện startup
-    @app.on_event("startup")
-    async def startup_event():
-        """Hàm được gọi khi ứng dụng khởi động với thông tin chi tiết hơn"""
-        logger.info("=" * 40)
-        logger.info("Ứng dụng AI Job Matcher đang khởi động...")
-
-        # Ghi log thông tin hệ thống
-        logger.info(f"Phiên bản Python: {sys.version}")
-        logger.info(f"API docs: {'Bật' if ENABLE_DOCS else 'Tắt'}")
-        logger.info(f"Chế độ debug: {'Bật' if os.getenv('DEBUG', 'False').lower() == 'true' else 'Tắt'}")
-
-        # Ghi log thông tin phần cứng
-        logger.info(f"CPU: {psutil.cpu_count()} luồng")
-        ram_gb = psutil.virtual_memory().total / 1024 / 1024 / 1024
-        logger.info(f"RAM: {ram_gb:.2f} GB")
-
-        # Kiểm tra GPU
-        has_gpu = False
-        try:
-            import torch
-            has_gpu = torch.cuda.is_available()
-            if has_gpu:
-                gpu_count = torch.cuda.device_count()
-                logger.info(f"GPU: {gpu_count} thiết bị")
-                for i in range(gpu_count):
-                    logger.info(f"- GPU {i}: {torch.cuda.get_device_name(i)}")
-            else:
-                logger.info("GPU: Không có")
-        except ImportError:
-            logger.info("GPU: Không kiểm tra được (torch không được cài đặt)")
-
-        # Đảm bảo các thư mục tồn tại
-        os.makedirs(settings.TEMP_DIR, exist_ok=True)
-        os.makedirs(settings.MODEL_DIR, exist_ok=True)
-        os.makedirs(os.path.join(settings.TEMP_DIR, "crawler_cache"), exist_ok=True)
-        os.makedirs(os.path.join(settings.TEMP_DIR, "matcher_cache"), exist_ok=True)
-        os.makedirs("logs/errors", exist_ok=True)
-
-        # Dọn dẹp tệp cache cũ
-        await cleanup_old_cache_files()
-
-        # Cấu hình GPU nếu có
-        configure_gpu()
-
-        # Khởi tạo các biến toàn cục
-        app.state.models_loaded = False
-        app.state.startup_time = time.time()
-        app.state.request_count = 0
-        app.state.error_count = 0
-
-        # Tải các mô hình trong background để không chặn khởi động ứng dụng
-        asyncio.create_task(load_models_async())
-
-        logger.info("Ứng dụng AI Job Matcher đã sẵn sàng phục vụ!")
-        logger.info("=" * 40)
-
-    async def cleanup_old_cache_files():
-        """Dọn dẹp các tệp cache cũ"""
-        try:
-            # Các thư mục cần dọn dẹp
-            cache_dirs = [
-                os.path.join(settings.TEMP_DIR, "crawler_cache"),
-                os.path.join(settings.TEMP_DIR, "matcher_cache"),
-                os.path.join(settings.TEMP_DIR, "web_search_cache")
-            ]
-
-            max_age = 7 * 24 * 60 * 60  # 7 ngày
-            current_time = time.time()
-            total_removed = 0
-            total_size_freed = 0
-
-            for cache_dir in cache_dirs:
-                if not os.path.exists(cache_dir):
-                    continue
-
-                for filename in os.listdir(cache_dir):
-                    file_path = os.path.join(cache_dir, filename)
-                    if not os.path.isfile(file_path):
-                        continue
-
-                    file_age = current_time - os.path.getmtime(file_path)
-                    if file_age > max_age:
-                        file_size = os.path.getsize(file_path)
-                        try:
-                            os.unlink(file_path)
-                            total_removed += 1
-                            total_size_freed += file_size
-                        except Exception as e:
-                            logger.warning(f"Không thể xóa tệp cache {file_path}: {e}")
-
-            if total_removed > 0:
-                logger.info(
-                    f"Đã dọn dẹp {total_removed} tệp cache cũ, giải phóng {total_size_freed / (1024 * 1024):.2f} MB")
-
-        except Exception as e:
-            logger.error(f"Lỗi khi dọn dẹp tệp cache: {e}")
-
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        """Hàm được gọi khi ứng dụng tắt với thông tin chi tiết hơn"""
-        logger.info("=" * 40)
-        logger.info("Ứng dụng AI Job Matcher đang tắt...")
-
-        # Hiển thị thống kê
-        uptime = time.time() - app.state.startup_time
-        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
-
-        logger.info(f"Thời gian hoạt động: {uptime_str}")
-
-        if hasattr(app.state, "request_count"):
-            logger.info(f"Tổng số yêu cầu đã xử lý: {app.state.request_count}")
-
-        if hasattr(app.state, "error_count"):
-            logger.info(f"Tổng số lỗi: {app.state.error_count}")
-
-        # Giải phóng tài nguyên GPU nếu có
-        try:
-            import torch
-            if torch.cuda.is_available():
-                logger.info("Đang giải phóng bộ nhớ GPU...")
-                torch.cuda.empty_cache()
-                logger.info("Đã giải phóng bộ nhớ GPU")
-        except Exception as e:
-            logger.warning(f"Không thể giải phóng bộ nhớ GPU: {e}")
-
-        # Đóng các kết nối mạng nếu còn mở
-        try:
-            import aiohttp
-            if hasattr(app.state, "http_session") and not app.state.http_session.closed:
-                logger.info("Đóng phiên HTTP...")
-                await app.state.http_session.close()
-        except Exception as e:
-            logger.warning(f"Không thể đóng phiên HTTP: {e}")
-
-        # Đồng bộ hóa tệp log cuối cùng
-        try:
-            for handler in logger.handlers:
-                if hasattr(handler, 'flush'):
-                    handler.flush()
-        except Exception as e:
-            pass
-
-        logger.info("Ứng dụng AI Job Matcher đã tắt an toàn")
-        logger.info("=" * 40)
-
     # Cải thiện health check endpoint
-    @app.get("/health", tags=["System"])
+    @application.get("/health", tags=["System"])
     async def health_check():
         """
         Kiểm tra sức khỏe hệ thống chi tiết hơn
@@ -444,11 +330,11 @@ def create_application() -> FastAPI:
         from datetime import datetime
 
         # Cập nhật số lượng yêu cầu
-        if hasattr(app.state, "request_count"):
-            app.state.request_count += 1
+        if hasattr(application.state, "request_count"):
+            application.state.request_count += 1
 
         # Thông tin cơ bản
-        uptime = time.time() - app.state.startup_time
+        uptime = time.time() - application.state.startup_time if hasattr(application.state, "startup_time") else 0
 
         health_data = {
             "status": "healthy",
@@ -463,11 +349,12 @@ def create_application() -> FastAPI:
                 "process_memory": psutil.Process().memory_info().rss / (1024 * 1024)  # MB
             },
             "services": {
-                "models_loaded": app.state.models_loaded
+                "models_loaded": application.state.models_loaded if hasattr(application.state,
+                                                                            "models_loaded") else False
             },
             "stats": {
-                "request_count": app.state.request_count if hasattr(app.state, "request_count") else 0,
-                "error_count": app.state.error_count if hasattr(app.state, "error_count") else 0
+                "request_count": application.state.request_count if hasattr(application.state, "request_count") else 0,
+                "error_count": application.state.error_count if hasattr(application.state, "error_count") else 0
             }
         }
 
@@ -526,6 +413,114 @@ def create_application() -> FastAPI:
                 content=health_data
             )
 
+    # Cải thiện sự kiện startup
+    @application.on_event("startup")
+    async def startup_event():
+        """Hàm được gọi khi ứng dụng khởi động với thông tin chi tiết hơn"""
+        logger.info("=" * 40)
+        logger.info("Ứng dụng AI Job Matcher đang khởi động...")
+
+        # Ghi log thông tin hệ thống
+        logger.info(f"Phiên bản Python: {sys.version}")
+        logger.info(f"API docs: {'Bật' if ENABLE_DOCS else 'Tắt'}")
+        logger.info(f"Chế độ debug: {'Bật' if os.getenv('DEBUG', 'False').lower() == 'true' else 'Tắt'}")
+
+        # Ghi log thông tin phần cứng
+        logger.info(f"CPU: {psutil.cpu_count()} luồng")
+        ram_gb = psutil.virtual_memory().total / 1024 / 1024 / 1024
+        logger.info(f"RAM: {ram_gb:.2f} GB")
+
+        # Kiểm tra GPU
+        has_gpu = False
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+            if has_gpu:
+                gpu_count = torch.cuda.device_count()
+                logger.info(f"GPU: {gpu_count} thiết bị")
+                for i in range(gpu_count):
+                    logger.info(f"- GPU {i}: {torch.cuda.get_device_name(i)}")
+            else:
+                logger.info("GPU: Không có")
+        except ImportError:
+            logger.info("GPU: Không kiểm tra được (torch không được cài đặt)")
+
+        # Đảm bảo các thư mục tồn tại
+        os.makedirs(settings.TEMP_DIR, exist_ok=True)
+        os.makedirs(settings.MODEL_DIR, exist_ok=True)
+        os.makedirs(os.path.join(settings.TEMP_DIR, "crawler_cache"), exist_ok=True)
+        os.makedirs(os.path.join(settings.TEMP_DIR, "matcher_cache"), exist_ok=True)
+        os.makedirs("logs/errors", exist_ok=True)
+
+        # Dọn dẹp tệp cache cũ
+        await cleanup_old_cache_files()
+
+        # Cấu hình GPU nếu có
+        configure_gpu()
+
+        # Khởi tạo các biến toàn cục
+        application.state.models_loaded = False
+        application.state.startup_time = time.time()
+        application.state.request_count = 0
+        application.state.error_count = 0
+
+        # Tải các mô hình trong background để không chặn khởi động ứng dụng
+        asyncio.create_task(load_models_async())
+
+        logger.info("Ứng dụng AI Job Matcher đã sẵn sàng phục vụ!")
+        logger.info("=" * 40)
+
+    @application.on_event("shutdown")
+    async def shutdown_event():
+        """Hàm được gọi khi ứng dụng tắt với thông tin chi tiết hơn"""
+        logger.info("=" * 40)
+        logger.info("Ứng dụng AI Job Matcher đang tắt...")
+
+        # Hiển thị thống kê
+        uptime = time.time() - application.state.startup_time if hasattr(application.state, "startup_time") else 0
+        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+
+        logger.info(f"Thời gian hoạt động: {uptime_str}")
+
+        if hasattr(application.state, "request_count"):
+            logger.info(f"Tổng số yêu cầu đã xử lý: {application.state.request_count}")
+
+        if hasattr(application.state, "error_count"):
+            logger.info(f"Tổng số lỗi: {application.state.error_count}")
+
+        # Giải phóng tài nguyên GPU nếu có
+        try:
+            import torch
+            if torch.cuda.is_available():
+                logger.info("Đang giải phóng bộ nhớ GPU...")
+                torch.cuda.empty_cache()
+                logger.info("Đã giải phóng bộ nhớ GPU")
+        except Exception as e:
+            logger.warning(f"Không thể giải phóng bộ nhớ GPU: {e}")
+
+        # Đóng các kết nối mạng nếu còn mở
+        try:
+            import aiohttp
+            if hasattr(application.state, "http_session") and not application.state.http_session.closed:
+                logger.info("Đóng phiên HTTP...")
+                await application.state.http_session.close()
+        except Exception as e:
+            logger.warning(f"Không thể đóng phiên HTTP: {e}")
+
+        # Đồng bộ hóa tệp log cuối cùng
+        try:
+            for handler in logger.handlers:
+                if hasattr(handler, 'flush'):
+                    handler.flush()
+        except Exception as e:
+            pass
+
+        logger.info("Ứng dụng AI Job Matcher đã tắt an toàn")
+        logger.info("=" * 40)
+
+    return application
+
+
 # Biến lưu thời gian bắt đầu ứng dụng
 app_start_time = time.time()
 
@@ -535,48 +530,6 @@ app = create_application()
 # Cờ để kiểm tra xem các mô hình đã được tải hay chưa
 models_loaded = False
 
-@app.on_event("startup")
-async def startup_event():
-    """Hàm được gọi khi ứng dụng khởi động"""
-    logger.info("Ứng dụng AI Job Matcher đang khởi động...")
-    logger.info(f"API documentation: {'Bật' if ENABLE_DOCS else 'Tắt'}")
-
-    # Đảm bảo các thư mục tồn tại
-    os.makedirs(settings.TEMP_DIR, exist_ok=True)
-    os.makedirs(settings.MODEL_DIR, exist_ok=True)
-    os.makedirs(os.path.join(settings.TEMP_DIR, "crawler_cache"), exist_ok=True)
-    os.makedirs(os.path.join(settings.TEMP_DIR, "matcher_cache"), exist_ok=True)
-
-    # Cấu hình GPU nếu có
-    configure_gpu()
-
-    # Tải các mô hình trong background để không chặn khởi động ứng dụng
-    asyncio.create_task(load_models_async())
-
-    logger.info("Ứng dụng AI Job Matcher đã sẵn sàng phục vụ!")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Hàm được gọi khi ứng dụng tắt"""
-    logger.info("Ứng dụng AI Job Matcher đang tắt...")
-
-    # Giải phóng tài nguyên GPU nếu có
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            logger.info("Đã giải phóng bộ nhớ GPU")
-    except:
-        pass
-
-    # Dọn dẹp tệp tạm nếu cần
-    try:
-        logger.info("Đang dọn dẹp tệp tạm...")
-        # Xóa các tệp cache quá hạn nếu cần
-    except:
-        pass
-
-    logger.info("Ứng dụng AI Job Matcher đã tắt an toàn")
 
 @app.get("/", tags=["Root"])
 async def root():
@@ -593,6 +546,49 @@ async def root():
         response["docs"] = docs_url
 
     return response
+
+
+async def cleanup_old_cache_files():
+    """Dọn dẹp các tệp cache cũ"""
+    try:
+        # Các thư mục cần dọn dẹp
+        cache_dirs = [
+            os.path.join(settings.TEMP_DIR, "crawler_cache"),
+            os.path.join(settings.TEMP_DIR, "matcher_cache"),
+            os.path.join(settings.TEMP_DIR, "web_search_cache")
+        ]
+
+        max_age = 7 * 24 * 60 * 60  # 7 ngày
+        current_time = time.time()
+        total_removed = 0
+        total_size_freed = 0
+
+        for cache_dir in cache_dirs:
+            if not os.path.exists(cache_dir):
+                continue
+
+            for filename in os.listdir(cache_dir):
+                file_path = os.path.join(cache_dir, filename)
+                if not os.path.isfile(file_path):
+                    continue
+
+                file_age = current_time - os.path.getmtime(file_path)
+                if file_age > max_age:
+                    file_size = os.path.getsize(file_path)
+                    try:
+                        os.unlink(file_path)
+                        total_removed += 1
+                        total_size_freed += file_size
+                    except Exception as e:
+                        logger.warning(f"Không thể xóa tệp cache {file_path}: {e}")
+
+        if total_removed > 0:
+            logger.info(
+                f"Đã dọn dẹp {total_removed} tệp cache cũ, giải phóng {total_size_freed / (1024 * 1024):.2f} MB")
+
+    except Exception as e:
+        logger.error(f"Lỗi khi dọn dẹp tệp cache: {e}")
+
 
 async def load_models_async():
     """
@@ -621,6 +617,7 @@ async def load_models_async():
 
         # Đánh dấu là đã tải xong
         models_loaded = True
+        app.state.models_loaded = True
         logger.info("Hoàn tất tải mô hình!")
 
         # Tải các mô hình ưu tiên thấp trong background
@@ -635,6 +632,8 @@ async def load_models_async():
         logger.error(f"Lỗi khi tải mô hình: {e}")
         # Đánh dấu là đã tải nếu có ít nhất những mô hình cần thiết
         models_loaded = True
+        app.state.models_loaded = True
+
 
 async def load_model(model_type: str) -> bool:
     """
@@ -673,10 +672,11 @@ async def load_model(model_type: str) -> bool:
                 fallback_path = get_fallback_model_path(model_type)
                 if fallback_path:
                     try:
+                        from sentence_transformers import SentenceTransformer
                         _ = SentenceTransformer(fallback_path)
                         logger.info(f"Đã tải mô hình Sentence Transformer dự phòng: {fallback_path}")
                         return True
-                    except:
+                    except Exception:
                         pass
                 return False
 

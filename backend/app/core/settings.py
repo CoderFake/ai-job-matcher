@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         "careerviet.vn"
     ]
 
+    # Add these two missing fields
+    ENABLE_DOCS: bool = False
+    DEBUG: bool = False
+
     @field_validator("USE_GPU")
     def validate_gpu(cls, v):
         """Xác nhận nếu GPU có thể được sử dụng"""
