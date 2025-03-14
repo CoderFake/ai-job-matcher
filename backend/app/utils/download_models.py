@@ -1,7 +1,3 @@
-"""
-Script tự động tải các mô hình AI cần thiết
-"""
-
 import os
 import sys
 import logging
@@ -19,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger("download_models")
 
 # Thư mục lưu trữ mô hình
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "models")
+MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # Danh sách mô hình cần tải
@@ -64,12 +60,6 @@ MODELS = {
 
 
 def check_gpu() -> bool:
-    """
-    Kiểm tra xem GPU có khả dụng không
-
-    Returns:
-        bool: True nếu GPU khả dụng, False nếu không
-    """
     try:
         # Kiểm tra GPU với torch
         import torch
@@ -80,15 +70,6 @@ def check_gpu() -> bool:
 
 
 def download_transformers_model(model_name: str) -> bool:
-    """
-    Tải mô hình từ Hugging Face Transformers
-
-    Args:
-        model_name: Tên mô hình
-
-    Returns:
-        bool: True nếu tải thành công, False nếu không
-    """
     try:
         from transformers import AutoModel, AutoTokenizer
 
@@ -349,7 +330,6 @@ def main():
                 f"Bỏ qua mô hình tùy chọn {model_id} ({model_info['name']}) - {model_info['use_case']} ({model_info['size_mb']} MB)")
 
     logger.info("Quá trình tải mô hình đã hoàn tất!")
-
 
 if __name__ == "__main__":
     main()
