@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter
 from app.api.endpoints import cv, jobs, users
 
