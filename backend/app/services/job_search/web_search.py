@@ -156,7 +156,7 @@ class WebSearcher:
 
     def _search_on_web(self, query: str, max_results: int = 20) -> List[Dict[str, str]]:
         """
-        Thực hiện tìm kiếm trên web
+        Thực hiện tìm kiếm trên web với cơ chế retry
 
         Args:
             query: Chuỗi tìm kiếm
@@ -165,38 +165,49 @@ class WebSearcher:
         Returns:
             List[Dict[str, str]]: Danh sách kết quả tìm kiếm
         """
+        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type((Exception))
+        )
+        def _perform_search():
+            try:
+                from duckduckgo_search import DDGS
+
+                # Bổ sung các trang tuyển dụng ưu tiên
+                for site in settings.JOB_SITES:
+                    # Chỉ thêm site: vào query nếu trang đó chưa có trong query
+                    if site not in query:
+                        query = f"{query} site:{site}"
+
+                # Thực hiện tìm kiếm
+                ddgs = DDGS()
+                results = list(ddgs.text(query, max_results=max_results))
+
+                # Chuẩn hóa kết quả
+                normalized_results = []
+
+                for result in results:
+                    normalized_result = {
+                        "title": result.get("title", ""),
+                        "url": result.get("href", ""),
+                        "snippet": result.get("body", "")
+                    }
+                    normalized_results.append(normalized_result)
+
+                return normalized_results
+            except Exception as e:
+                logger.error(f"Lỗi khi tìm kiếm với DuckDuckGo: {str(e)}")
+                raise e
+
         try:
-            from duckduckgo_search import DDGS
-
-            # Bổ sung các trang tuyển dụng ưu tiên
-            for site in settings.JOB_SITES:
-                # Chỉ thêm site: vào query nếu trang đó chưa có trong query
-                if site not in query:
-                    query = f"{query} site:{site}"
-
-            # Thực hiện tìm kiếm
-            ddgs = DDGS()
-            results = list(ddgs.text(query, max_results=max_results))
-
-            # Chuẩn hóa kết quả
-            normalized_results = []
-
-            for result in results:
-                normalized_result = {
-                    "title": result.get("title", ""),
-                    "url": result.get("href", ""),
-                    "snippet": result.get("body", "")
-                }
-                normalized_results.append(normalized_result)
-
-            return normalized_results
-
+            return _perform_search()
         except Exception as e:
-            logger.error(f"Lỗi khi tìm kiếm trên web: {str(e)}")
-
-            # Thử phương pháp khác nếu DuckDuckGo không hoạt động
+            logger.error(f"Tất cả các lần thử tìm kiếm đều thất bại: {str(e)}")
+            # Phương pháp dự phòng nếu DuckDuckGo không hoạt động
             return self._search_with_serpapi(query, max_results)
-
     def _search_with_serpapi(self, query: str, max_results: int = 20) -> List[Dict[str, str]]:
         """
         Thực hiện tìm kiếm với SerpAPI
@@ -329,7 +340,7 @@ class WebSearcher:
             if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
                 logger.warning(f"URL không trả về HTML: {url}, Content-Type: {content_type}")
                 return None
-            
+
             # Phân tích HTML
             soup = BeautifulSoup(response.text, "html.parser")
 
@@ -996,7 +1007,7 @@ class WebSearcher:
 
     def _get_from_cache(self, query: str) -> Optional[List[JobData]]:
         """
-        Lấy kết quả từ cache
+        Lấy kết quả từ cache với cơ chế kiểm tra thời hạn
 
         Args:
             query: Chuỗi tìm kiếm
@@ -1013,7 +1024,14 @@ class WebSearcher:
             try:
                 # Kiểm tra thời gian tạo tệp
                 file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
-                if datetime.now() - file_time < timedelta(hours=24):  # Cache có hiệu lực trong 24 giờ
+                # Tính hạn sử dụng dựa trên từ khóa tìm kiếm
+                # Các từ khóa phổ biến sẽ có thời gian cache ngắn hơn
+                if any(keyword in query.lower() for keyword in ["urgent", "gấp", "hot", "new", "mới"]):
+                    max_age = timedelta(hours=6)  # 6 giờ cho từ khóa gấp
+                else:
+                    max_age = timedelta(hours=24)  # 24 giờ cho trường hợp thông thường
+
+                if datetime.now() - file_time < max_age:
                     # Đọc dữ liệu cache
                     with open(cache_path, "r", encoding="utf-8") as f:
                         cache_data = json.load(f)
@@ -1024,14 +1042,17 @@ class WebSearcher:
                         try:
                             job = JobData.model_validate(job_dict)
                             jobs.append(job)
-                        except Exception as e:
-                            return jobs
+                        except ValidationError as e:
+                            logger.warning(f"Lỗi khi chuyển đổi dữ liệu cache: {str(e)}")
+                            continue
 
                     return jobs
 
+                logger.info(f"Cache đã hết hạn cho query: {query}")
             except Exception as e:
-                logger.error(f"Lỗi khi chuyển đổi dữ liệu cache: {str(e)}")
-                return None
+                logger.error(f"Lỗi khi đọc cache: {str(e)}")
+
+        return None
 
     def _save_to_cache(self, query: str, jobs: List[JobData]) -> None:
         """

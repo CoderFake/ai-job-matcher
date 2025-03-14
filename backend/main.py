@@ -1,8 +1,3 @@
-"""
-AI Job Matcher - Ứng dụng phân tích CV và tìm kiếm việc làm tự động
-Phiên bản cải tiến
-"""
-
 import logging
 import json
 import os
@@ -10,9 +5,12 @@ import sys
 import asyncio
 import time
 import traceback
+import uuid
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
+import psutil
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -142,62 +140,301 @@ def create_application() -> FastAPI:
                 redoc_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
             )
 
-    # Trình xử lý lỗi chung
-    @application.exception_handler(HTTPException)
+    # Cải thiện xử lý lỗi và quản lý tài nguyên trong main.py
+
+    # Trình xử lý lỗi chung nâng cao
+    @app.exception_handler(HTTPException)
     async def http_exception_handler(request, exc):
-        logger.error(f"HTTP error: {exc.detail}")
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"message": exc.detail},
+        """Xử lý lỗi HTTP một cách chi tiết hơn"""
+        # Ghi log với thông tin bổ sung
+        client_host = request.client.host if request.client else "unknown"
+        user_agent = request.headers.get("user-agent", "unknown")
+        endpoint = request.url.path
+
+        logger.error(
+            f"HTTP error: {exc.detail} | "
+            f"Status code: {exc.status_code} | "
+            f"Client: {client_host} | "
+            f"Endpoint: {endpoint} | "
+            f"User-Agent: {user_agent[:50]}..."
         )
 
-    @application.exception_handler(Exception)
+        # Trả về phản hồi chi tiết hơn
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.status_code,
+                    "message": exc.detail,
+                    "type": "http_exception"
+                },
+                "success": False
+            },
+        )
+
+    @app.exception_handler(Exception)
     async def general_exception_handler(request, exc):
+        """Xử lý các loại lỗi không mong đợi"""
         # Ghi log chi tiết với traceback
         exc_traceback = traceback.format_exc()
-        logger.error(f"Unhandled error: {str(exc)}\n{exc_traceback}")
+
+        # Lấy thông tin client
+        client_host = request.client.host if request.client else "unknown"
+        endpoint = request.url.path
+        method = request.method
+
+        error_id = str(uuid.uuid4())[:8]  # Tạo ID cho lỗi để theo dõi
+
+        logger.critical(
+            f"Unhandled error [{error_id}]: {str(exc)} | "
+            f"Method: {method} | "
+            f"Endpoint: {endpoint} | "
+            f"Client: {client_host}\n{exc_traceback}"
+        )
+
+        # Lưu thông tin lỗi vào tệp riêng để phân tích sau
+        error_log_dir = Path("logs/errors")
+        error_log_dir.mkdir(exist_ok=True, parents=True)
+
+        error_log_path = error_log_dir / f"error_{error_id}_{int(time.time())}.log"
+
+        try:
+            with open(error_log_path, "w") as f:
+                f.write(f"Time: {datetime.now().isoformat()}\n")
+                f.write(f"Error ID: {error_id}\n")
+                f.write(f"Error Type: {type(exc).__name__}\n")
+                f.write(f"Error Message: {str(exc)}\n")
+                f.write(f"Endpoint: {endpoint}\n")
+                f.write(f"Method: {method}\n")
+                f.write(f"Client: {client_host}\n")
+                f.write("\nTraceback:\n")
+                f.write(exc_traceback)
+        except Exception as log_error:
+            logger.error(f"Failed to write error log: {str(log_error)}")
 
         # Phản hồi an toàn cho người dùng
         return JSONResponse(
             status_code=500,
-            content={"message": "Đã xảy ra lỗi không mong muốn. Vui lòng thử lại sau."},
+            content={
+                "error": {
+                    "code": 500,
+                    "message": "Đã xảy ra lỗi không mong muốn. Vui lòng thử lại sau.",
+                    "error_id": error_id,  # Thêm ID để người dùng có thể tham chiếu khi báo lỗi
+                    "type": "internal_server_error"
+                },
+                "success": False
+            },
         )
 
-    # Middleware ghi log yêu cầu
-    @application.middleware("http")
-    async def log_requests(request: Request, call_next):
+    # Cải thiện middleware ghi log yêu cầu
+    @app.middleware("http")
+    async def log_and_process_request(request: Request, call_next):
+        """
+        Middleware ghi log và xử lý yêu cầu với nhiều thông tin hơn và theo dõi hiệu suất
+        """
         # Lấy đường dẫn và phương thức
         path = request.url.path
         method = request.method
         client = request.client.host if request.client else "unknown"
+        user_agent = request.headers.get("user-agent", "")
+        content_type = request.headers.get("content-type", "")
+        request_id = str(uuid.uuid4())[:8]  # Tạo ID cho yêu cầu
 
-        # Ghi log nếu không phải là yêu cầu static files
-        if not path.startswith("/static"):
-            start_time = time.time()
-            logger.info(f"[{client}] {method} {path}")
+        # Bỏ qua ghi log cho các tệp tĩnh và yêu cầu health check
+        skip_detailed_logging = path.startswith("/static") or path == "/health"
 
-            # Xử lý yêu cầu và đo thời gian
-            try:
-                response = await call_next(request)
-                process_time = time.time() - start_time
-                response.headers["X-Process-Time"] = str(process_time)
+        # Ghi log bắt đầu yêu cầu
+        if not skip_detailed_logging:
+            logger.info(f"[{request_id}] {client} {method} {path} started")
+            if len(user_agent) > 0:
+                logger.debug(f"[{request_id}] User-Agent: {user_agent[:100]}")
 
-                # Ghi log kết quả
-                logger.info(f"[{client}] {method} {path} - {response.status_code} ({process_time:.4f}s)")
-                return response
-            except Exception as e:
-                # Ghi log lỗi nếu có
-                process_time = time.time() - start_time
-                logger.error(f"[{client}] {method} {path} - Error: {str(e)} ({process_time:.4f}s)")
-                raise
-        else:
-            return await call_next(request)
+        # Xử lý yêu cầu và đo thời gian
+        start_time = time.time()
 
-    # Health check endpoint
-    @application.get("/health", tags=["System"])
+        try:
+            # Chờ phản hồi
+            response = await call_next(request)
+
+            # Tính thời gian xử lý
+            process_time = time.time() - start_time
+
+            # Thêm headers hữu ích
+            response.headers["X-Process-Time"] = str(process_time)
+            response.headers["X-Request-ID"] = request_id
+
+            # Ghi log kết thúc yêu cầu
+            if not skip_detailed_logging:
+                status_code = response.status_code
+                logger.info(f"[{request_id}] {client} {method} {path} completed - {status_code} ({process_time:.4f}s)")
+
+                # Ghi log chi tiết nếu là yêu cầu chậm
+                if process_time > 1.0:  # Yêu cầu chậm > 1 giây
+                    logger.warning(f"Slow request: [{request_id}] {method} {path} - {process_time:.4f}s")
+
+            return response
+
+        except Exception as e:
+            # Tính thời gian xử lý
+            process_time = time.time() - start_time
+
+            # Ghi log lỗi
+            logger.error(f"[{request_id}] {client} {method} {path} failed - Error: {str(e)} ({process_time:.4f}s)")
+
+            # Tiếp tục nâng lỗi
+            raise
+
+    # Cải thiện sự kiện startup
+    @app.on_event("startup")
+    async def startup_event():
+        """Hàm được gọi khi ứng dụng khởi động với thông tin chi tiết hơn"""
+        logger.info("=" * 40)
+        logger.info("Ứng dụng AI Job Matcher đang khởi động...")
+
+        # Ghi log thông tin hệ thống
+        logger.info(f"Phiên bản Python: {sys.version}")
+        logger.info(f"API docs: {'Bật' if ENABLE_DOCS else 'Tắt'}")
+        logger.info(f"Chế độ debug: {'Bật' if os.getenv('DEBUG', 'False').lower() == 'true' else 'Tắt'}")
+
+        # Ghi log thông tin phần cứng
+        logger.info(f"CPU: {psutil.cpu_count()} luồng")
+        ram_gb = psutil.virtual_memory().total / 1024 / 1024 / 1024
+        logger.info(f"RAM: {ram_gb:.2f} GB")
+
+        # Kiểm tra GPU
+        has_gpu = False
+        try:
+            import torch
+            has_gpu = torch.cuda.is_available()
+            if has_gpu:
+                gpu_count = torch.cuda.device_count()
+                logger.info(f"GPU: {gpu_count} thiết bị")
+                for i in range(gpu_count):
+                    logger.info(f"- GPU {i}: {torch.cuda.get_device_name(i)}")
+            else:
+                logger.info("GPU: Không có")
+        except ImportError:
+            logger.info("GPU: Không kiểm tra được (torch không được cài đặt)")
+
+        # Đảm bảo các thư mục tồn tại
+        os.makedirs(settings.TEMP_DIR, exist_ok=True)
+        os.makedirs(settings.MODEL_DIR, exist_ok=True)
+        os.makedirs(os.path.join(settings.TEMP_DIR, "crawler_cache"), exist_ok=True)
+        os.makedirs(os.path.join(settings.TEMP_DIR, "matcher_cache"), exist_ok=True)
+        os.makedirs("logs/errors", exist_ok=True)
+
+        # Dọn dẹp tệp cache cũ
+        await cleanup_old_cache_files()
+
+        # Cấu hình GPU nếu có
+        configure_gpu()
+
+        # Khởi tạo các biến toàn cục
+        app.state.models_loaded = False
+        app.state.startup_time = time.time()
+        app.state.request_count = 0
+        app.state.error_count = 0
+
+        # Tải các mô hình trong background để không chặn khởi động ứng dụng
+        asyncio.create_task(load_models_async())
+
+        logger.info("Ứng dụng AI Job Matcher đã sẵn sàng phục vụ!")
+        logger.info("=" * 40)
+
+    async def cleanup_old_cache_files():
+        """Dọn dẹp các tệp cache cũ"""
+        try:
+            # Các thư mục cần dọn dẹp
+            cache_dirs = [
+                os.path.join(settings.TEMP_DIR, "crawler_cache"),
+                os.path.join(settings.TEMP_DIR, "matcher_cache"),
+                os.path.join(settings.TEMP_DIR, "web_search_cache")
+            ]
+
+            max_age = 7 * 24 * 60 * 60  # 7 ngày
+            current_time = time.time()
+            total_removed = 0
+            total_size_freed = 0
+
+            for cache_dir in cache_dirs:
+                if not os.path.exists(cache_dir):
+                    continue
+
+                for filename in os.listdir(cache_dir):
+                    file_path = os.path.join(cache_dir, filename)
+                    if not os.path.isfile(file_path):
+                        continue
+
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > max_age:
+                        file_size = os.path.getsize(file_path)
+                        try:
+                            os.unlink(file_path)
+                            total_removed += 1
+                            total_size_freed += file_size
+                        except Exception as e:
+                            logger.warning(f"Không thể xóa tệp cache {file_path}: {e}")
+
+            if total_removed > 0:
+                logger.info(
+                    f"Đã dọn dẹp {total_removed} tệp cache cũ, giải phóng {total_size_freed / (1024 * 1024):.2f} MB")
+
+        except Exception as e:
+            logger.error(f"Lỗi khi dọn dẹp tệp cache: {e}")
+
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        """Hàm được gọi khi ứng dụng tắt với thông tin chi tiết hơn"""
+        logger.info("=" * 40)
+        logger.info("Ứng dụng AI Job Matcher đang tắt...")
+
+        # Hiển thị thống kê
+        uptime = time.time() - app.state.startup_time
+        uptime_str = f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s"
+
+        logger.info(f"Thời gian hoạt động: {uptime_str}")
+
+        if hasattr(app.state, "request_count"):
+            logger.info(f"Tổng số yêu cầu đã xử lý: {app.state.request_count}")
+
+        if hasattr(app.state, "error_count"):
+            logger.info(f"Tổng số lỗi: {app.state.error_count}")
+
+        # Giải phóng tài nguyên GPU nếu có
+        try:
+            import torch
+            if torch.cuda.is_available():
+                logger.info("Đang giải phóng bộ nhớ GPU...")
+                torch.cuda.empty_cache()
+                logger.info("Đã giải phóng bộ nhớ GPU")
+        except Exception as e:
+            logger.warning(f"Không thể giải phóng bộ nhớ GPU: {e}")
+
+        # Đóng các kết nối mạng nếu còn mở
+        try:
+            import aiohttp
+            if hasattr(app.state, "http_session") and not app.state.http_session.closed:
+                logger.info("Đóng phiên HTTP...")
+                await app.state.http_session.close()
+        except Exception as e:
+            logger.warning(f"Không thể đóng phiên HTTP: {e}")
+
+        # Đồng bộ hóa tệp log cuối cùng
+        try:
+            for handler in logger.handlers:
+                if hasattr(handler, 'flush'):
+                    handler.flush()
+        except Exception as e:
+            pass
+
+        logger.info("Ứng dụng AI Job Matcher đã tắt an toàn")
+        logger.info("=" * 40)
+
+    # Cải thiện health check endpoint
+    @app.get("/health", tags=["System"])
     async def health_check():
         """
-        Kiểm tra sức khỏe hệ thống
+        Kiểm tra sức khỏe hệ thống chi tiết hơn
 
         Returns:
             Dict: Thông tin sức khỏe hệ thống
@@ -206,16 +443,31 @@ def create_application() -> FastAPI:
         import psutil
         from datetime import datetime
 
+        # Cập nhật số lượng yêu cầu
+        if hasattr(app.state, "request_count"):
+            app.state.request_count += 1
+
         # Thông tin cơ bản
+        uptime = time.time() - app.state.startup_time
+
         health_data = {
             "status": "healthy",
             "version": settings.VERSION,
             "timestamp": datetime.now().isoformat(),
-            "uptime": time.time() - app_start_time,
+            "uptime": uptime,
+            "uptime_formatted": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m {int(uptime % 60)}s",
             "system": {
                 "cpu_usage": psutil.cpu_percent(),
                 "memory_usage": psutil.virtual_memory().percent,
-                "disk_usage": psutil.disk_usage('/').percent
+                "disk_usage": psutil.disk_usage('/').percent,
+                "process_memory": psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+            },
+            "services": {
+                "models_loaded": app.state.models_loaded
+            },
+            "stats": {
+                "request_count": app.state.request_count if hasattr(app.state, "request_count") else 0,
+                "error_count": app.state.error_count if hasattr(app.state, "error_count") else 0
             }
         }
 
@@ -223,24 +475,56 @@ def create_application() -> FastAPI:
         try:
             import torch
             if torch.cuda.is_available():
-                health_data["gpu"] = {
+                gpu_info = {
                     "available": True,
+                    "count": torch.cuda.device_count(),
                     "name": torch.cuda.get_device_name(0),
-                    "memory_allocated": torch.cuda.memory_allocated(0) / (1024**3),  # GB
-                    "memory_reserved": torch.cuda.memory_reserved(0) / (1024**3)     # GB
                 }
+
+                # Thêm thông tin sử dụng GPU nếu có thể
+                try:
+                    gpu_info["memory_allocated"] = torch.cuda.memory_allocated(0) / (1024 ** 3)  # GB
+                    gpu_info["memory_reserved"] = torch.cuda.memory_reserved(0) / (1024 ** 3)  # GB
+                    gpu_info["max_memory_allocated"] = torch.cuda.max_memory_allocated(0) / (1024 ** 3)  # GB
+                except Exception:
+                    pass
+
+                health_data["gpu"] = gpu_info
             else:
                 health_data["gpu"] = {"available": False}
         except:
             health_data["gpu"] = {"available": False, "error": "GPU check failed"}
 
         # Kiểm tra không gian đĩa
-        health_data["disk_space_sufficient"] = check_disk_space(1.0)
+        disk_space_sufficient = check_disk_space(1.0)
+        health_data["disk_space_sufficient"] = disk_space_sufficient
 
-        # Trả về kết quả
-        return health_data
+        # Nếu hệ thống gặp vấn đề nghiêm trọng, đánh dấu là không khỏe mạnh
+        if (psutil.virtual_memory().percent > 95 or
+                psutil.cpu_percent() > 95 or
+                psutil.disk_usage('/').percent > 95 or
+                not disk_space_sufficient):
+            health_data["status"] = "unhealthy"
 
-    return application
+            # Chi tiết về vấn đề
+            health_data["issues"] = []
+            if psutil.virtual_memory().percent > 95:
+                health_data["issues"].append("memory_critical")
+            if psutil.cpu_percent() > 95:
+                health_data["issues"].append("cpu_critical")
+            if psutil.disk_usage('/').percent > 95:
+                health_data["issues"].append("disk_critical")
+            if not disk_space_sufficient:
+                health_data["issues"].append("disk_space_insufficient")
+
+        # Trả về với mã trạng thái thích hợp
+        if health_data["status"] == "healthy":
+            return health_data
+        else:
+            return JSONResponse(
+                status_code=503,  # Service Unavailable
+                content=health_data
+            )
 
 # Biến lưu thời gian bắt đầu ứng dụng
 app_start_time = time.time()

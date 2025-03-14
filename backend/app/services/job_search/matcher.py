@@ -1,12 +1,12 @@
 """
 Module phân tích mức độ phù hợp giữa CV và công việc
 """
-
+import asyncio
 import os
 import logging
 import json
 import re
-from typing import Dict, Any, List, Tuple, Optional, Set
+from typing import Dict, Any, List, Tuple, Optional, Set, Coroutine
 from datetime import datetime, timedelta
 import math
 from pathlib import Path
@@ -616,7 +616,8 @@ class JobMatcher:
 
         return 0.5
 
-    def _match_location(self, cv: CVData, job: JobData) -> Tuple[float, Optional[float]]:
+    def _match_location(self, cv: CVData, job: JobData) -> tuple[float, None] | tuple[
+        float, Coroutine[Any, Any, float]] | tuple[float, float]:
         """
         Phân tích mức độ phù hợp về địa điểm
 
@@ -655,12 +656,12 @@ class JobMatcher:
             else:
                 return 0.2, distance  # Xa
         except:
-            # Nếu không thể tính khoảng cách, điểm là 0.5
+
             return 0.5, None
 
-    def _calculate_distance(self, location1: str, location2: str) -> float:
+    async def _calculate_distance(self, location1: str, location2: str) -> float:
         """
-        Tính khoảng cách giữa hai địa điểm
+        Tính khoảng cách giữa hai địa điểm bất kỳ sử dụng API bản đồ
 
         Args:
             location1: Địa điểm thứ nhất
@@ -669,67 +670,173 @@ class JobMatcher:
         Returns:
             float: Khoảng cách (km)
         """
-        # Đây là một hàm giả định, trong thực tế cần sử dụng API như Google Maps
-        # hoặc một cơ sở dữ liệu địa lý
+        # Sử dụng bộ nhớ đệm cho kết quả tính toán khoảng cách
+        if not hasattr(self, "_distance_cache"):
+            self._distance_cache = {}
 
-        # Chuẩn hóa địa điểm
-        location1 = location1.lower()
-        location2 = location2.lower()
+        # Tạo key cache
+        key = f"{location1.lower()}|{location2.lower()}"
+        reversed_key = f"{location2.lower()}|{location1.lower()}"
 
-        # Xác định khoảng cách giữa các thành phố lớn (đơn vị: km)
-        distances = {
-            ("hà nội", "hồ chí minh"): 1714,
-            ("hà nội", "đà nẵng"): 764,
-            ("hồ chí minh", "đà nẵng"): 970,
-            ("hà nội", "hải phòng"): 102,
-            ("hồ chí minh", "cần thơ"): 169,
-            ("hà nội", "vinh"): 300,
-            ("hồ chí minh", "nha trang"): 411,
-            ("hồ chí minh", "vũng tàu"): 107,
-            ("hà nội", "huế"): 654
-        }
+        # Kiểm tra cache
+        if key in self._distance_cache:
+            return self._distance_cache[key]
+        if reversed_key in self._distance_cache:
+            return self._distance_cache[reversed_key]
 
-        # Xác định các biến thể của tên thành phố
-        city_variants = {
-            "hà nội": ["hà nội", "hanoi", "ha noi"],
-            "hồ chí minh": ["hồ chí minh", "tp hcm", "tp. hcm", "hochiminh", "ho chi minh", "sài gòn", "sai gon", "saigon", "thành phố hồ chí minh"],
-            "đà nẵng": ["đà nẵng", "da nang", "danang"],
-            "hải phòng": ["hải phòng", "hai phong", "haiphong"],
-            "cần thơ": ["cần thơ", "can tho", "cantho"],
-            "vinh": ["vinh", "nghệ an", "nghe an"],
-            "nha trang": ["nha trang", "nhatrang", "khánh hòa", "khanh hoa"],
-            "vũng tàu": ["vũng tàu", "vung tau", "bà rịa vũng tàu", "ba ria vung tau"],
-            "huế": ["huế", "hue", "thừa thiên huế", "thua thien hue"]
-        }
-
-        # Chuẩn hóa tên thành phố
-        city1 = None
-        city2 = None
-
-        for city, variants in city_variants.items():
-            if any(variant in location1 for variant in variants):
-                city1 = city
-            if any(variant in location2 for variant in variants):
-                city2 = city
-
-        if city1 is None or city2 is None:
-            raise ValueError("Không thể xác định thành phố")
-
-        # Nếu hai thành phố giống nhau, khoảng cách là 0
-        if city1 == city2:
+        # Nếu hai địa điểm giống nhau, khoảng cách là 0
+        if location1.lower() == location2.lower():
+            self._distance_cache[key] = 0.0
             return 0.0
 
-        # Tìm khoảng cách
-        key = (city1, city2)
-        reverse_key = (city2, city1)
+        try:
+            import aiohttp
+            from urllib.parse import quote
 
-        if key in distances:
-            return distances[key]
-        elif reverse_key in distances:
-            return distances[reverse_key]
-        else:
-            # Nếu không có dữ liệu về khoảng cách, trả về giá trị mặc định
-            return 1000.0
+            # Chuẩn hóa địa điểm để tìm kiếm chính xác hơn
+            def normalize_location(loc):
+                # Thêm "Việt Nam" nếu chưa có
+                if "việt nam" not in loc.lower() and "vietnam" not in loc.lower():
+                    return f"{loc}, Việt Nam"
+                return loc
+
+            location1_norm = normalize_location(location1)
+            location2_norm = normalize_location(location2)
+
+            # 1. Sử dụng Nominatim API (OpenStreetMap) để lấy tọa độ
+            async def get_coordinates(location):
+                url = f"https://nominatim.openstreetmap.org/search?q={quote(location)}&format=json&limit=1"
+
+                async with aiohttp.ClientSession() as session:
+                    headers = {
+                        "User-Agent": "AI_Job_Matcher/1.0",  # Cần thiết cho Nominatim API
+                        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+                    }
+
+                    for attempt in range(3):  # Thử lại tối đa 3 lần
+                        try:
+                            async with session.get(url, headers=headers) as response:
+                                if response.status == 200:
+                                    data = await response.json()
+                                    if data and len(data) > 0:
+                                        return {
+                                            "lat": float(data[0]["lat"]),
+                                            "lon": float(data[0]["lon"]),
+                                            "display_name": data[0]["display_name"]
+                                        }
+                                elif response.status == 429:  # Too Many Requests
+                                    await asyncio.sleep(2 * (attempt + 1))  # Tăng thời gian chờ
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Lỗi khi lấy tọa độ cho {location} (lần {attempt + 1}): {str(e)}")
+                            await asyncio.sleep(1)
+
+                    return None
+
+            # 2. Lấy tọa độ cho cả hai địa điểm
+            coords1 = await get_coordinates(location1_norm)
+            # Chờ 1 giây để tránh rate limit của API
+            await asyncio.sleep(1)
+            coords2 = await get_coordinates(location2_norm)
+
+            if coords1 is None or coords2 is None:
+                logger.warning(f"Không thể lấy tọa độ cho {location1} hoặc {location2}")
+                # Trả về một khoảng cách ước tính nếu không thể xác định tọa độ
+                distance = 50.0  # 50km là một giá trị mặc định hợp lý
+                self._distance_cache[key] = distance
+                return distance
+
+            logger.info(f"Đã tìm thấy: {location1} -> {coords1['display_name']}")
+            logger.info(f"Đã tìm thấy: {location2} -> {coords2['display_name']}")
+
+            # 3. Sử dụng OSRM API để tính khoảng cách thực tế theo đường đi
+            try:
+                # Format: lon1,lat1;lon2,lat2
+                route_url = (f"http://router.project-osrm.org/route/v1/driving/"
+                             f"{coords1['lon']},{coords1['lat']};"
+                             f"{coords2['lon']},{coords2['lat']}?overview=false")
+
+                async with aiohttp.ClientSession() as session:
+                    for attempt in range(3):  # Thử lại tối đa 3 lần
+                        try:
+                            async with session.get(route_url) as response:
+                                if response.status == 200:
+                                    route_data = await response.json()
+                                    if route_data["code"] == "Ok" and len(route_data["routes"]) > 0:
+                                        # Khoảng cách tính bằng mét, chuyển sang km
+                                        distance = route_data["routes"][0]["distance"] / 1000
+                                        logger.info(f"Khoảng cách thực tế: {distance:.2f}km")
+                                        self._distance_cache[key] = distance
+                                        return distance
+                                elif response.status == 429:  # Too Many Requests
+                                    await asyncio.sleep(2 * (attempt + 1))
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Lỗi khi tính khoảng cách với OSRM API (lần {attempt + 1}): {str(e)}")
+                            await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Lỗi khi sử dụng OSRM API: {str(e)}")
+
+            # 4. Nếu OSRM không hoạt động, dùng API thay thế như MapQuest, nếu có API key
+            # Ví dụ với MapQuest (cần API key)
+            try:
+                mapquest_key = os.environ.get("MAPQUEST_API_KEY")
+                if mapquest_key:
+                    mapquest_url = (f"http://www.mapquestapi.com/directions/v2/route?"
+                                    f"key={mapquest_key}&from={coords1['lat']},{coords1['lon']}"
+                                    f"&to={coords2['lat']},{coords2['lon']}")
+
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(mapquest_url) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                if data.get("route") and "distance" in data["route"]:
+                                    # Khoảng cách đã tính bằng km
+                                    distance = data["route"]["distance"]
+                                    self._distance_cache[key] = distance
+                                    return distance
+            except Exception as e:
+                logger.error(f"Lỗi khi sử dụng MapQuest API: {str(e)}")
+
+            # 5. Cuối cùng, nếu không API nào hoạt động, sử dụng công thức Haversine (đường chim bay)
+            import math
+
+            def haversine(lat1, lon1, lat2, lon2):
+                R = 6371.0  # Bán kính Trái Đất tính bằng km
+
+                # Chuyển đổi từ độ sang radian
+                lat1_rad = math.radians(lat1)
+                lon1_rad = math.radians(lon1)
+                lat2_rad = math.radians(lat2)
+                lon2_rad = math.radians(lon2)
+
+                # Hiệu số giữa các tọa độ
+                dlon = lon2_rad - lon1_rad
+                dlat = lat2_rad - lat1_rad
+
+                # Công thức Haversine
+                a = math.sin(dlat / 2) ** 2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+                c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+                # Khoảng cách
+                distance = R * c
+
+                return distance
+
+            haversine_distance = haversine(coords1['lat'], coords1['lon'], coords2['lat'], coords2['lon'])
+            # Thêm 30% để ước tính đường đi thực tế (đường chim bay thường ngắn hơn đường đi thực tế)
+            distance = haversine_distance * 1.3
+            logger.info(f"Ước tính khoảng cách (Haversine * 1.3): {distance:.2f}km")
+
+            self._distance_cache[key] = distance
+            return distance
+
+        except Exception as e:
+            logger.error(f"Lỗi không xác định khi tính khoảng cách giữa {location1} và {location2}: {str(e)}")
+            # Trả về khoảng cách ước tính nếu có lỗi
+            distance = 50.0
+            self._distance_cache[key] = distance
+            return distance
 
     def _match_salary(self, cv: CVData, job: JobData) -> Tuple[float, bool]:
         """

@@ -1,7 +1,9 @@
 import os
 import logging
+import re
 import tempfile
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple, Union, BinaryIO
@@ -250,7 +252,7 @@ class CVExtractor:
 
     def process_cv_file(self, file_path: str, use_llm: bool = True) -> CVData:
         """
-        Xử lý tệp CV và trích xuất thông tin
+        Xử lý tệp CV và trích xuất thông tin với cơ chế retry và xử lý lỗi tốt hơn
 
         Args:
             file_path: Đường dẫn đến tệp CV
@@ -259,32 +261,184 @@ class CVExtractor:
         Returns:
             CVData: Đối tượng dữ liệu CV
         """
-        try:
-            # Trích xuất văn bản từ tệp
-            text, file_type = self.extract_text_from_file(file_path)
+        start_time = time.time()
+        logger.info(f"Bắt đầu xử lý tệp CV: {file_path}")
 
-            if not text:
-                logger.error(f"Không thể trích xuất văn bản từ {file_path}")
+        # Kiểm tra tệp tồn tại và có thể đọc được
+        if not os.path.exists(file_path):
+            logger.error(f"Tệp CV không tồn tại: {file_path}")
+            return self._create_empty_cv_data(os.path.basename(file_path))
+
+        if not os.path.isfile(file_path) or not os.access(file_path, os.R_OK):
+            logger.error(f"Không thể đọc tệp CV: {file_path}")
+            return self._create_empty_cv_data(os.path.basename(file_path))
+
+        try:
+            # Xác định loại tệp
+            file_extension = os.path.splitext(file_path)[1].lower()
+
+            # Đảm bảo tệp có kích thước hợp lý
+            file_size = os.path.getsize(file_path)
+            logger.info(f"Kích thước tệp: {file_size / 1024:.2f} KB")
+
+            if file_size == 0:
+                logger.error(f"Tệp CV rỗng: {file_path}")
                 return self._create_empty_cv_data(os.path.basename(file_path))
 
-            # Xử lý case đặc biệt cho ảnh
-            if file_type == 'image':
-                # Nếu là ảnh, có thể sử dụng AI Vision để trích xuất trực tiếp
-                if use_llm:
-                    cv_data = self.image_parser.extract_info_with_ai(file_path)
-                    if cv_data:
-                        result = self._convert_json_to_cv_data(cv_data, os.path.basename(file_path))
-                        result.extracted_from_image = True
-                        result.raw_text = text
-                        return result
+            if file_size > 10 * 1024 * 1024:  # Giới hạn 10MB
+                logger.warning(f"Tệp CV quá lớn ({file_size / 1024 / 1024:.2f} MB): {file_path}")
 
-            # Phân tích văn bản
+            # Trích xuất văn bản từ tệp
+            text, file_type = None, None
+
+            # Thử lại tối đa 3 lần
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    text, file_type = self.extract_text_from_file(file_path)
+                    if text:
+                        break
+
+                    logger.warning(f"Không trích xuất được văn bản, thử lại ({attempt + 1}/{max_retries})")
+                    time.sleep(1)  # Chờ 1 giây trước khi thử lại
+                except Exception as e:
+                    logger.error(f"Lỗi khi trích xuất văn bản (lần {attempt + 1}): {str(e)}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                    else:
+                        raise
+
+            if not text:
+                logger.error(f"Không thể trích xuất văn bản từ {file_path} sau {max_retries} lần thử")
+
+                # Nếu là hình ảnh, thử biện pháp dự phòng với OCR nâng cao
+                if file_extension in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp']:
+                    logger.info(f"Thử dùng OCR nâng cao cho hình ảnh {file_path}")
+                    from app.services.cv_parser.image import ImageParser
+                    image_parser = ImageParser()
+
+                    # Cải thiện chất lượng hình ảnh
+                    improved_image = image_parser.improve_image_for_ocr(file_path)
+                    text = image_parser.extract_text(improved_image)
+
+                    if improved_image != file_path and os.path.exists(improved_image):
+                        os.unlink(improved_image)  # Xóa tệp cải thiện tạm thời
+
+                    if not text:
+                        # Nếu vẫn không trích xuất được văn bản, sử dụng AI Vision
+                        if use_llm:
+                            logger.info(f"Thử dùng AI Vision cho hình ảnh {file_path}")
+                            cv_data = image_parser.extract_info_with_ai(file_path)
+                            if cv_data:
+                                result = self._convert_json_to_cv_data(cv_data, os.path.basename(file_path))
+                                result.extracted_from_image = True
+
+                                # Thêm thông tin thêm
+                                processing_time = time.time() - start_time
+                                logger.info(f"Đã xử lý tệp CV trong {processing_time:.2f} giây với AI Vision")
+                                result.confidence_score = 0.7  # AI Vision thường có độ chính xác khá
+
+                                return result
+
+                # Trả về CV rỗng nếu không thể trích xuất văn bản
+                return self._create_empty_cv_data(os.path.basename(file_path))
+
+            # Thông tin về văn bản đã trích xuất
+            logger.info(f"Đã trích xuất {len(text)} ký tự từ {file_path}")
+
+            # Giới hạn kích thước văn bản để tránh quá tải LLM
+            max_text_size = 15000  # 15K ký tự
+            if len(text) > max_text_size:
+                logger.warning(f"Văn bản quá dài ({len(text)} ký tự), cắt bớt xuống {max_text_size} ký tự")
+                text = text[:max_text_size]
+
+            # Phân tích CV từ văn bản
             cv_data = self.parse_cv_from_text(text, os.path.basename(file_path), use_llm)
 
+            # Nâng cao dữ liệu CV
+            cv_data = self.enhance_cv_data(cv_data)
+
+            # Đánh giá độ tin cậy của kết quả
+            confidence_score = self._evaluate_confidence(cv_data)
+            cv_data.confidence_score = confidence_score
+
+            # Ghi lại thời gian xử lý
+            processing_time = time.time() - start_time
+            logger.info(f"Đã xử lý tệp CV trong {processing_time:.2f} giây (độ tin cậy: {confidence_score:.2f})")
+
             return cv_data
+
         except Exception as e:
-            logger.error(f"Lỗi khi xử lý tệp CV {file_path}: {str(e)}")
+            logger.error(f"Lỗi không xử lý được khi xử lý tệp CV {file_path}: {str(e)}", exc_info=True)
             return self._create_empty_cv_data(os.path.basename(file_path))
+
+    def _evaluate_confidence(self, cv_data: CVData) -> float:
+        """
+        Đánh giá độ tin cậy của dữ liệu CV đã trích xuất
+
+        Args:
+            cv_data: Đối tượng dữ liệu CV
+
+        Returns:
+            float: Điểm độ tin cậy (0.0 - 1.0)
+        """
+        score = 0.0
+        total_weight = 0.0
+
+        # Kiểm tra các trường thông tin cá nhân
+        personal_weight = 0.3
+        personal_score = 0.0
+
+        if cv_data.personal_info.name and len(cv_data.personal_info.name) > 3:
+            personal_score += 0.4
+
+        if cv_data.personal_info.email:
+            personal_score += 0.3
+
+        if cv_data.personal_info.phone:
+            personal_score += 0.3
+
+        score += personal_score * personal_weight
+        total_weight += personal_weight
+
+        # Kiểm tra học vấn
+        education_weight = 0.2
+        education_score = 0.0
+
+        if cv_data.education and len(cv_data.education) > 0:
+            edu_items = min(len(cv_data.education), 3)  # Tối đa 3 mục
+            education_score = edu_items / 3.0
+
+        score += education_score * education_weight
+        total_weight += education_weight
+
+        # Kiểm tra kinh nghiệm làm việc
+        experience_weight = 0.3
+        experience_score = 0.0
+
+        if cv_data.work_experience and len(cv_data.work_experience) > 0:
+            exp_items = min(len(cv_data.work_experience), 5)  # Tối đa 5 mục
+            experience_score = exp_items / 5.0
+
+        score += experience_score * experience_weight
+        total_weight += experience_weight
+
+        # Kiểm tra kỹ năng
+        skills_weight = 0.2
+        skills_score = 0.0
+
+        if cv_data.skills and len(cv_data.skills) > 0:
+            skills_items = min(len(cv_data.skills), 10)  # Tối đa 10 mục
+            skills_score = skills_items / 10.0
+
+        score += skills_score * skills_weight
+        total_weight += skills_weight
+
+        # Tính điểm cuối cùng
+        final_score = score / total_weight if total_weight > 0 else 0.0
+
+        # Giới hạn trong khoảng [0.0, 1.0]
+        return max(0.0, min(1.0, final_score))
 
     def enhance_cv_data(self, cv_data: CVData) -> CVData:
         """
@@ -336,7 +490,7 @@ class CVExtractor:
 
     def _extract_with_llm(self, text: str, file_source: str = None) -> CVData:
         """
-        Sử dụng LLM để trích xuất thông tin từ văn bản CV
+        Sử dụng LLM để trích xuất thông tin từ văn bản CV với xử lý lỗi tốt hơn
 
         Args:
             text: Văn bản CV
@@ -347,105 +501,185 @@ class CVExtractor:
         """
         try:
             from app.services.llm.local_model import LocalLLM
+            import json
+            import re
+            from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-            llm = LocalLLM()
+            # Chuẩn bị văn bản đầu vào
+            # Làm sạch văn bản
+            cleaned_text = self._clean_text(text)
 
+            # Giới hạn độ dài văn bản
+            max_length = 5000
+            if len(cleaned_text) > max_length:
+                logger.warning(f"Văn bản quá dài ({len(cleaned_text)} ký tự), cắt bớt xuống {max_length} ký tự")
+                cleaned_text = cleaned_text[:max_length]
+
+            # Khởi tạo LLM với retry
+            @retry(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=1, min=2, max=10),
+                retry=retry_if_exception_type(Exception)
+            )
+            def generate_with_llm(prompt):
+                llm = LocalLLM()
+                return llm.generate(prompt, max_tokens=2000, temperature=0.2)  # Giảm temperature để kết quả ổn định hơn
+
+            # Tạo prompt chi tiết hơn
             prompt = f"""
-            Dưới đây là văn bản trích xuất từ một CV/Resume. Hãy phân tích và trích xuất các thông tin quan trọng dưới dạng JSON.
+            Dưới đây là văn bản trích xuất từ một CV/Resume. Hãy phân tích cẩn thận và trích xuất các thông tin quan trọng dưới dạng JSON.
 
             Văn bản CV:
-            {text[:5000]}  # Giới hạn độ dài để tránh quá tải LLM
+            ```
+            {cleaned_text}
+            ```
 
             Hãy trích xuất và trả về thông tin dưới dạng JSON với các trường sau:
             {{
                 "personal_info": {{
-                    "name": "Tên người",
-                    "email": "email@example.com",
-                    "phone": "Số điện thoại",
-                    "address": "Địa chỉ",
-                    "city": "Thành phố",
-                    "country": "Quốc gia",
-                    "linkedin": "URL LinkedIn",
-                    "github": "URL Github",
-                    "website": "URL website cá nhân",
-                    "summary": "Tóm tắt bản thân"
+                    "name": "Tên người (trích xuất từ văn bản)",
+                    "email": "email nếu có (phải đúng định dạng email)",
+                    "phone": "số điện thoại nếu có (chỉ gồm chữ số và dấu +)",
+                    "address": "địa chỉ nếu có",
+                    "city": "thành phố nếu có",
+                    "country": "quốc gia nếu có",
+                    "linkedin": "URL LinkedIn nếu có",
+                    "github": "URL Github nếu có",
+                    "website": "URL website cá nhân nếu có",
+                    "summary": "tóm tắt bản thân nếu có"
                 }},
                 "education": [
                     {{
-                        "institution": "Tên trường",
-                        "degree": "Bằng cấp",
-                        "field_of_study": "Ngành học",
-                        "start_date": "Ngày bắt đầu (YYYY-MM-DD hoặc chỉ năm)",
-                        "end_date": "Ngày kết thúc (YYYY-MM-DD hoặc chỉ năm)",
-                        "description": "Mô tả",
-                        "gpa": "Điểm trung bình"
+                        "institution": "tên trường",
+                        "degree": "bằng cấp nếu có",
+                        "field_of_study": "ngành học nếu có",
+                        "start_date": "ngày bắt đầu (YYYY-MM-DD hoặc YYYY) nếu có",
+                        "end_date": "ngày kết thúc (YYYY-MM-DD hoặc YYYY) nếu có",
+                        "description": "mô tả nếu có",
+                        "gpa": "điểm trung bình nếu có"
                     }}
                 ],
                 "work_experience": [
                     {{
-                        "company": "Tên công ty",
-                        "position": "Vị trí",
-                        "start_date": "Ngày bắt đầu (YYYY-MM-DD hoặc chỉ năm)",
-                        "end_date": "Ngày kết thúc (YYYY-MM-DD hoặc chỉ năm)",
-                        "current": true/false,
-                        "description": "Mô tả công việc",
-                        "achievements": ["Thành tựu 1", "Thành tựu 2"],
-                        "location": "Địa điểm"
+                        "company": "tên công ty",
+                        "position": "vị trí",
+                        "start_date": "ngày bắt đầu (YYYY-MM-DD hoặc YYYY) nếu có",
+                        "end_date": "ngày kết thúc (YYYY-MM-DD hoặc YYYY) nếu có",
+                        "current": true/false (đang làm việc tại đây hay không),
+                        "description": "mô tả công việc nếu có",
+                        "achievements": ["thành tựu 1", "thành tựu 2"] (nếu có),
+                        "location": "địa điểm làm việc nếu có"
                     }}
                 ],
                 "skills": [
                     {{
-                        "name": "Tên kỹ năng",
-                        "level": "Cấp độ (nếu có)",
-                        "years": "Số năm kinh nghiệm (nếu có)",
-                        "category": "Danh mục kỹ năng"
+                        "name": "tên kỹ năng",
+                        "level": "cấp độ nếu có",
+                        "years": "số năm kinh nghiệm nếu có",
+                        "category": "danh mục kỹ năng nếu có"
                     }}
                 ],
                 "languages": [
                     {{
-                        "name": "Tên ngôn ngữ",
-                        "proficiency": "Mức độ thành thạo"
+                        "name": "tên ngôn ngữ",
+                        "proficiency": "mức độ thành thạo nếu có"
                     }}
                 ],
                 "projects": [
                     {{
-                        "name": "Tên dự án",
-                        "description": "Mô tả",
-                        "technologies": ["Công nghệ 1", "Công nghệ 2"],
-                        "url": "URL dự án",
-                        "role": "Vai trò"
+                        "name": "tên dự án",
+                        "description": "mô tả nếu có",
+                        "technologies": ["công nghệ 1", "công nghệ 2"] (nếu có),
+                        "url": "URL dự án nếu có",
+                        "role": "vai trò nếu có"
                     }}
                 ],
                 "certificates": [
                     {{
-                        "name": "Tên chứng chỉ",
-                        "issuer": "Tổ chức cấp",
-                        "date_issued": "Ngày cấp (YYYY-MM-DD)",
-                        "expiration_date": "Ngày hết hạn (YYYY-MM-DD)",
-                        "credential_id": "ID chứng chỉ",
-                        "url": "URL chứng chỉ"
+                        "name": "tên chứng chỉ",
+                        "issuer": "tổ chức cấp nếu có",
+                        "date_issued": "ngày cấp (YYYY-MM-DD) nếu có",
+                        "expiration_date": "ngày hết hạn (YYYY-MM-DD) nếu có",
+                        "credential_id": "ID chứng chỉ nếu có",
+                        "url": "URL chứng chỉ nếu có"
                     }}
                 ],
-                "job_title": "Vị trí công việc",
-                "years_of_experience": "Số năm kinh nghiệm tổng cộng",
-                "salary_expectation": "Mức lương mong muốn",
-                "preferred_location": "Địa điểm làm việc mong muốn"
+                "job_title": "vị trí công việc mong muốn (ví dụ: Software Engineer)",
+                "years_of_experience": số năm kinh nghiệm tổng cộng (số nguyên, chỉ điền nếu có thông tin rõ ràng),
+                "salary_expectation": "mức lương mong muốn nếu có",
+                "preferred_location": "địa điểm làm việc mong muốn nếu có"
             }}
 
             Chỉ trả về dữ liệu JSON hợp lệ, không thêm bất kỳ chú thích nào.
+            Nếu không thấy thông tin nào, hãy để trống hoặc null.
+            Đảm bảo JSON hợp lệ, đặc biệt là dấu ngoặc, dấu phẩy và chuỗi.
             """
 
-            result = llm.generate(prompt)
+            # Thực hiện gọi LLM
+            result = generate_with_llm(prompt)
 
             # Tìm và trích xuất JSON từ kết quả
             json_result = self._extract_json_from_text(result)
+
+            if not json_result:
+                # Nếu không tìm thấy JSON, thử lại với prompt đơn giản hơn
+                logger.warning("Không tìm thấy JSON trong kết quả LLM, thử lại với prompt đơn giản hơn")
+                simple_prompt = f"""
+                Dưới đây là văn bản trích xuất từ một CV. Hãy phân tích và trả về thông tin dưới dạng JSON đơn giản:
+
+                ```
+                {cleaned_text[:3000]}
+                ```
+
+                Trả về dạng JSON:
+                {{
+                    "personal_info": {{ "name": "", "email": "", "phone": "" }},
+                    "education": [{{ "institution": "", "degree": "", "field_of_study": "" }}],
+                    "work_experience": [{{ "company": "", "position": "" }}],
+                    "skills": [{{ "name": "" }}]
+                }}
+                """
+
+                result = generate_with_llm(simple_prompt)
+                json_result = self._extract_json_from_text(result)
+
+                if not json_result:
+                    logger.error("Không thể trích xuất JSON từ kết quả LLM sau nhiều lần thử")
+                    return self._create_empty_cv_data(file_source)
 
             # Chuyển đổi dữ liệu JSON thành đối tượng CVData
             return self._convert_json_to_cv_data(json_result, file_source)
 
         except Exception as e:
-            logger.error(f"Lỗi khi trích xuất thông tin với LLM: {str(e)}")
+            logger.error(f"Lỗi không xử lý được khi trích xuất với LLM: {str(e)}", exc_info=True)
             return self._create_empty_cv_data(file_source)
+
+    def _clean_text(self, text: str) -> str:
+        """
+        Làm sạch văn bản đầu vào
+
+        Args:
+            text: Văn bản cần làm sạch
+
+        Returns:
+            str: Văn bản đã làm sạch
+        """
+        if not text:
+            return ""
+
+        # Loại bỏ các ký tự đặc biệt không cần thiết
+        text = re.sub(r'[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]', '', text)
+
+        # Loại bỏ khoảng trắng thừa
+        text = re.sub(r'\s+', ' ', text)
+
+        # Loại bỏ các dòng trống liên tiếp
+        text = re.sub(r'\n\s*\n+', '\n\n', text)
+
+        # Loại bỏ khoảng trắng đầu dòng
+        text = re.sub(r'^\s+', '', text, flags=re.MULTILINE)
+
+        return text.strip()
 
     def _extract_json_from_text(self, text: str) -> Dict[str, Any]:
         """

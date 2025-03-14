@@ -71,9 +71,33 @@ class WebCrawler:
         self.session = None
 
     async def init_session(self):
-        """Khởi tạo session aiohttp nếu chưa có"""
+        """Khởi tạo session aiohttp với cấu hình tối ưu"""
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+            # Tạo TCPConnector với các cài đặt tùy chỉnh
+            connector = aiohttp.TCPConnector(
+                limit=10,
+                limit_per_host=2,
+                force_close=True,
+                enable_cleanup_closed=True,
+                ssl=False
+            )
+
+            timeout = aiohttp.ClientTimeout(
+                total=30,
+                connect=10,
+                sock_read=20,
+                sock_connect=10
+            )
+
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={
+                    # Thêm headers cơ bản
+                    "User-Agent": random.choice(self.user_agents),
+                    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
+                }
+            )
 
     async def close_session(self):
         """Đóng session aiohttp nếu có"""
@@ -246,7 +270,7 @@ class WebCrawler:
 
     async def _fetch_url(self, url: str) -> Optional[str]:
         """
-        Lấy nội dung HTML từ URL với cơ chế thử lại
+        Lấy nội dung HTML từ URL với cơ chế thử lại và rate limiting
 
         Args:
             url: URL cần lấy
@@ -257,10 +281,19 @@ class WebCrawler:
         try:
             # Kiểm tra và thực hiện delay để tránh bị chặn
             domain = urlparse(url).netloc
+
+            # Rate limiting theo domain
             if domain in self.last_request_time:
                 time_since_last_request = time.time() - self.last_request_time[domain]
-                if time_since_last_request < self.delay:
-                    await asyncio.sleep(self.delay - time_since_last_request)
+                # Delay tối thiểu 2 giây giữa các yêu cầu đến cùng một domain
+                required_delay = max(self.delay, 2)
+
+                # Thêm jitter (biến động) để tránh các yêu cầu đồng thời
+                jitter = random.uniform(0.5, 1.5)
+                required_delay *= jitter
+
+                if time_since_last_request < required_delay:
+                    await asyncio.sleep(required_delay - time_since_last_request)
 
             # Kiểm tra đảm bảo session đã được khởi tạo
             if self.session is None or self.session.closed:
@@ -274,36 +307,66 @@ class WebCrawler:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1"
+                "Upgrade-Insecure-Requests": "1",
+                # Thêm header Referer để tránh bị chặn
+                "Referer": "https://www.google.com/"
             }
 
             # Sử dụng semaphore để giới hạn số lượng yêu cầu đồng thời
             async with self.semaphore:
                 for retry in range(self.max_retries):
                     try:
-                        async with self.session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
+                        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+                        async with self.session.get(
+                                url,
+                                headers=headers,
+                                timeout=timeout,
+                                allow_redirects=True,
+                                ssl=False  # Bỏ qua lỗi SSL
+                        ) as response:
                             # Cập nhật thời gian yêu cầu cuối cùng
                             self.last_request_time[domain] = time.time()
 
-                            if response.status != 200:
-                                error_msg = f"Không thể truy cập URL: {url}, mã trạng thái: {response.status}"
-                                if response.status == 429:
-                                    # Quá nhiều yêu cầu, tăng delay
-                                    error_msg += " (Too Many Requests)"
-                                    # Chờ lâu hơn giữa các lần thử lại
-                                    await asyncio.sleep(self.delay * 2 * (retry + 1))
-                                elif response.status in (403, 503):
-                                    # Có thể là do chặn bot
-                                    error_msg += " (Có thể do chặn bot)"
-                                    # Đổi User-Agent và chờ lâu hơn
-                                    headers["User-Agent"] = random.choice(self.user_agents)
-                                    await asyncio.sleep(self.delay * 3 * (retry + 1))
+                            if response.status == 429:  # Too Many Requests
+                                # Tính toán thời gian chờ từ header Retry-After nếu có
+                                retry_after = response.headers.get('Retry-After')
+                                if retry_after and retry_after.isdigit():
+                                    wait_time = int(retry_after) + random.uniform(1, 3)
+                                else:
+                                    # Nếu không có Retry-After, tăng thời gian chờ theo cấp số nhân
+                                    wait_time = self.delay * (2 ** retry) + random.uniform(1, 5)
 
-                                logger.warning(f"{error_msg} (lần thử {retry+1}/{self.max_retries})")
-
-                                if retry == self.max_retries - 1:
-                                    return None
+                                logger.warning(f"Rate limit cho {domain}, chờ {wait_time:.2f}s và thử lại")
+                                await asyncio.sleep(wait_time)
                                 continue
+
+                            elif response.status in (403, 503):  # Forbidden hoặc Service Unavailable
+                                # Có thể là do chặn bot
+                                logger.warning(f"Phát hiện chặn bot trên {domain} (status={response.status})")
+                                # Đổi User-Agent và chờ lâu hơn
+                                headers["User-Agent"] = random.choice(self.user_agents)
+                                # Thêm header mới để giả lập browser
+                                headers["Cache-Control"] = "max-age=0"
+                                headers["Sec-Ch-Ua"] = '"Google Chrome";v="113", "Chromium";v="113"'
+                                headers["Sec-Ch-Ua-Mobile"] = "?0"
+                                headers["Sec-Ch-Ua-Platform"] = '"Windows"'
+                                headers["Sec-Fetch-Dest"] = "document"
+                                headers["Sec-Fetch-Mode"] = "navigate"
+                                headers["Sec-Fetch-Site"] = "none"
+                                headers["Sec-Fetch-User"] = "?1"
+                                headers["Pragma"] = "no-cache"
+
+                                wait_time = self.delay * (3 ** retry) + random.uniform(2, 8)
+                                await asyncio.sleep(wait_time)
+                                continue
+
+                            elif response.status != 200:
+                                logger.warning(
+                                    f"Không thể truy cập URL: {url}, mã trạng thái: {response.status} (lần thử {retry + 1}/{self.max_retries})")
+                                if retry < self.max_retries - 1:
+                                    await asyncio.sleep(self.delay * (retry + 1))
+                                    continue
+                                return None
 
                             # Lấy nội dung HTML
                             content_type = response.headers.get("Content-Type", "")
@@ -316,14 +379,18 @@ class WebCrawler:
                             return await response.text()
 
                     except asyncio.TimeoutError:
-                        logger.warning(f"Timeout khi truy cập URL: {url} (lần thử {retry+1}/{self.max_retries})")
+                        logger.warning(f"Timeout khi truy cập URL: {url} (lần thử {retry + 1}/{self.max_retries})")
                         if retry < self.max_retries - 1:
                             await asyncio.sleep(self.delay * (retry + 1))
 
                     except aiohttp.ClientError as e:
-                        logger.warning(f"Lỗi client khi truy cập URL: {url}: {str(e)} (lần thử {retry+1}/{self.max_retries})")
+                        logger.warning(
+                            f"Lỗi client khi truy cập URL: {url}: {str(e)} (lần thử {retry + 1}/{self.max_retries})")
                         if retry < self.max_retries - 1:
                             await asyncio.sleep(self.delay * (retry + 1))
+
+                    # Tăng biến động thời gian chờ để tránh bot detection
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
 
                 return None
 

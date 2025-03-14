@@ -85,6 +85,7 @@ class CVExtractTextResponse(BaseModel):
     file_name: str = Field(..., description="Tên tệp gốc")
 
 
+# Thêm cải tiến vào phương thức upload_cv
 @router.post("/upload", response_model=CVUploadResponse, summary="Tải lên CV")
 async def upload_cv(
         file: UploadFile = File(..., description="Tệp CV (PDF, Word, Excel, hình ảnh)"),
@@ -98,68 +99,75 @@ async def upload_cv(
     Trả về thông tin về tệp đã tải lên và ID để sử dụng trong các API khác.
     """
     try:
-        # Kiểm tra kích thước tệp
-        try:
-            file_size = 0
-            content = await file.read(1024 * 1024)  # Đọc 1MB đầu tiên
-            file_size = len(content)
-
-            while content:
-                if file_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"Kích thước tệp quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB."
-                    )
-                content = await file.read(1024 * 1024)  # Đọc tiếp 1MB
-                if content:
-                    file_size += len(content)
-
-            # Reset file pointer
-            await file.seek(0)
-        except Exception as e:
-            if "file_size" in locals() and file_size > MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Kích thước tệp quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB."
-                )
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Lỗi khi kiểm tra kích thước tệp: {str(e)}"
-                )
-
-        # Kiểm tra định dạng tệp
-        file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
-        if file_ext not in SUPPORTED_EXTENSIONS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Không hỗ trợ loại tệp {file_ext}. Hỗ trợ các định dạng: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
-            )
+        # Kiểm tra kích thước tệp với cơ chế tối ưu
+        file_size = 0
+        temp_file_path = None
 
         # Tạo thư mục tạm thời để lưu tệp nếu chưa có
         upload_dir = Path(tempfile.gettempdir()) / "ai_job_matcher_uploads"
         upload_dir.mkdir(exist_ok=True)
 
-        # Tạo ID cho CV dựa trên timestamp và UUID
-        cv_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        # Tạo tệp tạm với context manager để đảm bảo được xóa nếu có lỗi
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                temp_file_path = tmp.name
+                chunk_size = 1024 * 1024  # 1MB chunks
+                chunk = await file.read(chunk_size)
+
+                while chunk:
+                    size = len(chunk)
+                    file_size += size
+
+                    if file_size > MAX_FILE_SIZE:
+                        # Đóng và xóa tệp nếu vượt quá giới hạn
+                        tmp.close()
+                        os.unlink(temp_file_path)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Kích thước tệp quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB."
+                        )
+
+                    tmp.write(chunk)
+                    chunk = await file.read(chunk_size)
+        except Exception as e:
+            # Xóa tệp tạm nếu có lỗi
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+            raise e
+
+        # Kiểm tra định dạng tệp và tính xác thực
+        file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
+        if file_ext not in SUPPORTED_EXTENSIONS:
+            # Xóa tệp tạm nếu định dạng không được hỗ trợ
+            if temp_file_path:
+                os.unlink(temp_file_path)
+
+            raise HTTPException(
+                status_code=400,
+                detail=f"Không hỗ trợ loại tệp {file_ext}. Hỗ trợ các định dạng: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
+            )
+
+        # Kiểm tra nội dung tệp có phù hợp với phần mở rộng không (chống giả mạo)
+        if not is_valid_file_content(temp_file_path, file_ext):
+            os.unlink(temp_file_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Nội dung tệp không phù hợp với định dạng {file_ext}"
+            )
 
         # Xử lý tên tệp để tránh các ký tự không hợp lệ
         safe_filename = "".join(c for c in file.filename if c.isalnum() or c in "._- ").strip()
         if not safe_filename:
             safe_filename = f"uploaded_file{file_ext}"
 
+        # Tạo ID cho CV dựa trên timestamp và UUID
+        cv_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
         # Tạo đường dẫn tệp cuối cùng
         file_path = upload_dir / f"{cv_id}_{safe_filename}"
 
-        # Lưu tệp
-        with open(file_path, "wb") as f:
-            # Đọc và ghi theo từng phần
-            chunk_size = 1024 * 1024  # 1MB
-            while True:
-                chunk = await file.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
+        # Di chuyển tệp từ thư mục tạm thời
+        shutil.move(temp_file_path, file_path)
 
         # Ghi log
         logger.info(f"Đã tải lên CV: {file.filename} -> {file_path} ({file_size} bytes)")
@@ -199,6 +207,50 @@ async def upload_cv(
         )
 
 
+# Thêm hàm kiểm tra nội dung tệp
+def is_valid_file_content(file_path: str, extension: str) -> bool:
+    """
+    Kiểm tra xem nội dung tệp có phù hợp với phần mở rộng không
+
+    Args:
+        file_path: Đường dẫn tệp
+        extension: Phần mở rộng của tệp
+
+    Returns:
+        bool: True nếu nội dung hợp lệ
+    """
+    try:
+        # Đọc vài byte đầu tiên của tệp
+        with open(file_path, "rb") as f:
+            header = f.read(8)  # 8 byte đầu tiên
+
+        # Kiểm tra signature của tệp theo từng loại
+        if extension == ".pdf" and header.startswith(b"%PDF"):
+            return True
+        elif extension in [".doc", ".docx"] and header.startswith(b"\xD0\xCF\x11\xE0") or header.startswith(
+                b"PK\x03\x04"):
+            return True
+        elif extension in [".xls", ".xlsx"] and header.startswith(b"\xD0\xCF\x11\xE0") or header.startswith(
+                b"PK\x03\x04"):
+            return True
+        elif extension in [".jpg", ".jpeg"] and header.startswith(b"\xFF\xD8\xFF"):
+            return True
+        elif extension == ".png" and header.startswith(b"\x89PNG\r\n\x1A\n"):
+            return True
+        elif extension == ".bmp" and header.startswith(b"BM"):
+            return True
+        elif extension == ".tif" or extension == ".tiff":
+            return header.startswith(b"II*\x00") or header.startswith(b"MM\x00*")
+        elif extension == ".webp" and header[4:8] == b"WEBP":
+            return True
+
+        # Mặc định trả về True cho các loại không kiểm tra được
+        return True
+    except Exception as e:
+        logger.error(f"Lỗi khi kiểm tra nội dung tệp {file_path}: {str(e)}")
+        return False
+
+
 def cleanup_old_files(directory: Path, max_age_hours: int = 24):
     """
     Xóa các tệp tạm thời cũ
@@ -210,14 +262,26 @@ def cleanup_old_files(directory: Path, max_age_hours: int = 24):
     try:
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
+        removed_count = 0
+        total_size_freed = 0
 
         # Kiểm tra từng tệp trong thư mục
         for file_path in directory.glob("*"):
             if file_path.is_file():
-                file_age = current_time - os.path.getmtime(file_path)
-                if file_age > max_age_seconds:
-                    os.unlink(file_path)
-                    logger.info(f"Đã xóa tệp cũ: {file_path}")
+                try:
+                    file_age = current_time - os.path.getmtime(file_path)
+                    if file_age > max_age_seconds:
+                        # Lưu kích thước tệp trước khi xóa
+                        file_size = os.path.getsize(file_path)
+                        os.unlink(file_path)
+                        removed_count += 1
+                        total_size_freed += file_size
+                        logger.info(f"Đã xóa tệp cũ: {file_path} (kích thước: {file_size / 1024:.2f} KB)")
+                except Exception as e:
+                    logger.warning(f"Không thể xóa tệp {file_path}: {str(e)}")
+
+        if removed_count > 0:
+            logger.info(f"Đã dọn dẹp {removed_count} tệp cũ, giải phóng {total_size_freed / (1024 * 1024):.2f} MB")
     except Exception as e:
         logger.error(f"Lỗi khi dọn dẹp tệp cũ: {str(e)}")
 
