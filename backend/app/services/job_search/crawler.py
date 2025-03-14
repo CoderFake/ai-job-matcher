@@ -1,5 +1,5 @@
 """
-Module thu thập thông tin chi tiết từ các trang việc làm
+Module thu thập thông tin chi tiết từ các trang việc làm với cải tiến
 """
 
 import os
@@ -7,21 +7,22 @@ import re
 import time
 import logging
 import tempfile
+import asyncio
 from typing import Dict, Any, List, Optional, Tuple, Union, Set
 from urllib.parse import urlparse, urljoin
 import json
 import hashlib
 from datetime import datetime, timedelta
 import random
-import asyncio
+import aiohttp
 from pathlib import Path
+from functools import lru_cache
 
 from app.core.logging import get_logger
 from app.core.settings import settings
-from app.models.job import JobData, CompanyInfo, Location, SalaryRange
+from app.models.job import JobData, CompanyInfo, Location, SalaryRange, JobSource, JobType, JobRequirement
 
 logger = get_logger("job_search")
-
 
 class WebCrawler:
     """
@@ -57,8 +58,27 @@ class WebCrawler:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 Edg/91.0.864.59"
         ]
 
-        # Khởi tạo session
+        # Semaphore cho việc giới hạn các yêu cầu đồng thời
+        self.semaphore = asyncio.Semaphore(5)  # Tối đa 5 yêu cầu đồng thời
+
+        # Lưu trữ thời gian yêu cầu cuối cùng cho mỗi domain
         self.last_request_time = {}
+
+        # Số lần thử lại tối đa
+        self.max_retries = 3
+
+        # Session aiohttp được tái sử dụng
+        self.session = None
+
+    async def init_session(self):
+        """Khởi tạo session aiohttp nếu chưa có"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+
+    async def close_session(self):
+        """Đóng session aiohttp nếu có"""
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     async def crawl_jobs(self, urls: List[str]) -> List[JobData]:
         """
@@ -70,28 +90,94 @@ class WebCrawler:
         Returns:
             List[JobData]: Danh sách thông tin việc làm
         """
+        if not urls:
+            return []
+
+        try:
+            # Khởi tạo session aiohttp
+            await self.init_session()
+
+            # Nhóm URL theo domain để tránh quá tải domain
+            domain_urls = {}
+            for url in urls:
+                domain = urlparse(url).netloc
+                if domain not in domain_urls:
+                    domain_urls[domain] = []
+                domain_urls[domain].append(url)
+
+            # Tạo danh sách task để crawl từng domain
+            all_tasks = []
+            for domain, domain_url_list in domain_urls.items():
+                # Tạo task crawl cho từng domain
+                domain_task = self._crawl_domain_urls(domain, domain_url_list)
+                all_tasks.append(domain_task)
+
+            # Chờ tất cả các task hoàn thành
+            domain_results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+            # Kết hợp tất cả kết quả
+            jobs = []
+            for result in domain_results:
+                if isinstance(result, Exception):
+                    logger.error(f"Lỗi khi crawl domain: {str(result)}")
+                else:
+                    jobs.extend(result)
+
+            return jobs
+
+        except Exception as e:
+            logger.error(f"Lỗi khi crawl danh sách công việc: {str(e)}")
+            return []
+        finally:
+            # Đóng session khi hoàn thành
+            await self.close_session()
+
+    async def _crawl_domain_urls(self, domain: str, urls: List[str]) -> List[JobData]:
+        """
+        Crawl các URL từ cùng một domain với rate limiting
+
+        Args:
+            domain: Tên miền
+            urls: Danh sách URL cùng domain
+
+        Returns:
+            List[JobData]: Danh sách thông tin việc làm
+        """
         jobs = []
-        tasks = []
+        # Tạo task pool với số lượng giới hạn mỗi domain (tối đa 3 yêu cầu đồng thời)
+        domain_semaphore = asyncio.Semaphore(3)
 
-        # Tạo các task để crawl bất đồng bộ
-        for url in urls:
-            task = asyncio.create_task(self.crawl_job(url))
-            tasks.append(task)
+        async def crawl_with_rate_limit(url):
+            # Đảm bảo rate limiting cho mỗi domain
+            if domain in self.last_request_time:
+                time_since_last_request = time.time() - self.last_request_time[domain]
+                if time_since_last_request < self.delay:
+                    await asyncio.sleep(self.delay - time_since_last_request)
 
-        # Chờ tất cả các task hoàn thành
+            async with domain_semaphore:
+                job = await self.crawl_job(url)
+                if job:
+                    return job
+                return None
+
+        # Tạo các task
+        tasks = [crawl_with_rate_limit(url) for url in urls]
+
+        # Chạy các task với giới hạn số lượng đồng thời
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Xử lý kết quả
         for result in results:
             if isinstance(result, Exception):
-                logger.error(f"Lỗi khi crawl: {str(result)}")
-            elif result:
+                logger.error(f"Lỗi khi crawl URL: {str(result)}")
+            elif result is not None:
                 jobs.append(result)
 
         return jobs
 
     async def crawl_job(self, url: str) -> Optional[JobData]:
         """
-        Thu thập thông tin chi tiết từ URL việc làm
+        Thu thập thông tin chi tiết từ URL việc làm với cơ chế thử lại
 
         Args:
             url: URL cần thu thập
@@ -120,20 +206,39 @@ class WebCrawler:
             if crawler_func is None:
                 crawler_func = self._crawl_generic
 
-            # Lấy HTML từ URL
-            html = await self._fetch_url(url)
-            if not html:
-                logger.warning(f"Không thể lấy HTML từ URL: {url}")
-                return None
+            # Thực hiện thử lại nếu cần
+            for retry in range(self.max_retries):
+                try:
+                    # Lấy HTML từ URL
+                    html = await self._fetch_url(url)
+                    if not html:
+                        logger.warning(f"Không thể lấy HTML từ URL: {url} (lần thử {retry+1}/{self.max_retries})")
+                        # Chờ lâu hơn giữa các lần thử lại
+                        await asyncio.sleep(self.delay * (retry + 1))
+                        continue
 
-            # Crawl thông tin
-            job = await crawler_func(url, html)
+                    # Crawl thông tin
+                    job = await crawler_func(url, html)
 
-            # Lưu vào cache nếu crawl thành công
-            if job:
-                self._save_to_cache(url, job)
+                    # Lưu vào cache nếu crawl thành công
+                    if job:
+                        self._save_to_cache(url, job)
+                        return job
+                    else:
+                        logger.warning(f"Không thể crawl thông tin từ URL: {url} (lần thử {retry+1}/{self.max_retries})")
 
-            return job
+                except aiohttp.ClientError as e:
+                    logger.warning(f"Lỗi kết nối khi crawl URL {url}: {str(e)} (lần thử {retry+1}/{self.max_retries})")
+                    # Chờ lâu hơn giữa các lần thử lại
+                    await asyncio.sleep(self.delay * (retry + 1))
+
+                except Exception as e:
+                    logger.error(f"Lỗi không mong đợi khi crawl URL {url}: {str(e)} (lần thử {retry+1}/{self.max_retries})")
+                    # Chờ lâu hơn giữa các lần thử lại
+                    await asyncio.sleep(self.delay * (retry + 1))
+
+            logger.error(f"Không thể crawl URL {url} sau {self.max_retries} lần thử")
+            return None
 
         except Exception as e:
             logger.error(f"Lỗi khi crawl URL {url}: {str(e)}")
@@ -141,7 +246,7 @@ class WebCrawler:
 
     async def _fetch_url(self, url: str) -> Optional[str]:
         """
-        Lấy nội dung HTML từ URL
+        Lấy nội dung HTML từ URL với cơ chế thử lại
 
         Args:
             url: URL cần lấy
@@ -157,11 +262,12 @@ class WebCrawler:
                 if time_since_last_request < self.delay:
                     await asyncio.sleep(self.delay - time_since_last_request)
 
+            # Kiểm tra đảm bảo session đã được khởi tạo
+            if self.session is None or self.session.closed:
+                await self.init_session()
+
             # Chọn ngẫu nhiên User-Agent
             user_agent = random.choice(self.user_agents)
-
-            # Thực hiện yêu cầu HTTP
-            import aiohttp
 
             headers = {
                 "User-Agent": user_agent,
@@ -171,24 +277,55 @@ class WebCrawler:
                 "Upgrade-Insecure-Requests": "1"
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=30) as response:
-                    # Cập nhật thời gian yêu cầu cuối cùng
-                    self.last_request_time[domain] = time.time()
+            # Sử dụng semaphore để giới hạn số lượng yêu cầu đồng thời
+            async with self.semaphore:
+                for retry in range(self.max_retries):
+                    try:
+                        async with self.session.get(url, headers=headers, timeout=30, allow_redirects=True) as response:
+                            # Cập nhật thời gian yêu cầu cuối cùng
+                            self.last_request_time[domain] = time.time()
 
-                    if response.status != 200:
-                        logger.warning(f"Không thể truy cập URL: {url}, mã trạng thái: {response.status}")
-                        return None
+                            if response.status != 200:
+                                error_msg = f"Không thể truy cập URL: {url}, mã trạng thái: {response.status}"
+                                if response.status == 429:
+                                    # Quá nhiều yêu cầu, tăng delay
+                                    error_msg += " (Too Many Requests)"
+                                    # Chờ lâu hơn giữa các lần thử lại
+                                    await asyncio.sleep(self.delay * 2 * (retry + 1))
+                                elif response.status in (403, 503):
+                                    # Có thể là do chặn bot
+                                    error_msg += " (Có thể do chặn bot)"
+                                    # Đổi User-Agent và chờ lâu hơn
+                                    headers["User-Agent"] = random.choice(self.user_agents)
+                                    await asyncio.sleep(self.delay * 3 * (retry + 1))
 
-                    # Lấy nội dung HTML
-                    content_type = response.headers.get("Content-Type", "")
+                                logger.warning(f"{error_msg} (lần thử {retry+1}/{self.max_retries})")
 
-                    # Kiểm tra loại nội dung
-                    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-                        logger.warning(f"URL không trả về HTML: {url}, Content-Type: {content_type}")
-                        return None
+                                if retry == self.max_retries - 1:
+                                    return None
+                                continue
 
-                    return await response.text()
+                            # Lấy nội dung HTML
+                            content_type = response.headers.get("Content-Type", "")
+
+                            # Kiểm tra loại nội dung
+                            if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                                logger.warning(f"URL không trả về HTML: {url}, Content-Type: {content_type}")
+                                return None
+
+                            return await response.text()
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout khi truy cập URL: {url} (lần thử {retry+1}/{self.max_retries})")
+                        if retry < self.max_retries - 1:
+                            await asyncio.sleep(self.delay * (retry + 1))
+
+                    except aiohttp.ClientError as e:
+                        logger.warning(f"Lỗi client khi truy cập URL: {url}: {str(e)} (lần thử {retry+1}/{self.max_retries})")
+                        if retry < self.max_retries - 1:
+                            await asyncio.sleep(self.delay * (retry + 1))
+
+                return None
 
         except Exception as e:
             logger.error(f"Lỗi khi lấy HTML từ URL {url}: {str(e)}")
@@ -245,8 +382,7 @@ class WebCrawler:
                         job_type = value_text
 
             # Tạo đối tượng công việc
-            from app.models.job import JobData, CompanyInfo, Location, JobType, ExperienceLevel, JobSource, \
-                JobRequirement
+            from app.models.job import JobData, CompanyInfo, Location, JobType, ExperienceLevel, JobSource, JobRequirement
 
             # Xác định loại công việc
             job_type_enum = JobType.FULL_TIME
@@ -286,7 +422,11 @@ class WebCrawler:
                     if skill:
                         skills.append(skill)
 
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
+
             job = JobData(
+                id=job_id,
                 title=title,
                 description=description,
                 company=CompanyInfo(name=company_name),
@@ -299,7 +439,8 @@ class WebCrawler:
                 requirements=JobRequirement(skills=skills),
                 source=JobSource.LINKEDIN,
                 source_url=url,
-                is_active=True
+                is_active=True,
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 30))  # Ước tính ngày đăng
             )
 
             return job
@@ -403,8 +544,12 @@ class WebCrawler:
                 elif "freelance" in job_type.lower():
                     job_type_enum = JobType.FREELANCE
 
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
+
             # Tạo đối tượng công việc
             job = JobData(
+                id=job_id,
                 title=title,
                 description=description,
                 company=CompanyInfo(name=company_name),
@@ -418,7 +563,8 @@ class WebCrawler:
                 source=JobSource.TOPCV,
                 source_url=url,
                 deadline=deadline,
-                is_active=True
+                is_active=True,
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 15))  # Ước tính ngày đăng
             )
 
             # Thêm mức lương nếu có
@@ -486,10 +632,26 @@ class WebCrawler:
                     from app.models.job import Benefit
                     benefits.append(Benefit(name=benefit_text))
 
+            # Trích xuất deadline
+            deadline = None
+            deadline_element = soup.select_one(".deadline")
+            if deadline_element:
+                deadline_text = deadline_element.text.strip()
+                match = re.search(r'(\d{2}/\d{2}/\d{4})', deadline_text)
+                if match:
+                    try:
+                        deadline = datetime.strptime(match.group(1), "%d/%m/%Y")
+                    except ValueError:
+                        pass
+
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
+
             # Tạo đối tượng công việc
             from app.models.job import JobData, CompanyInfo, Location, JobType, JobSource, JobRequirement
 
             job = JobData(
+                id=job_id,
                 title=title,
                 description=description,
                 company=CompanyInfo(name=company_name),
@@ -502,7 +664,9 @@ class WebCrawler:
                 benefits=benefits,
                 source=JobSource.VIETNAMWORKS,
                 source_url=url,
-                is_active=True
+                deadline=deadline,
+                is_active=True,
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 20))  # Ước tính ngày đăng
             )
 
             # Thêm mức lương nếu có
@@ -565,10 +729,24 @@ class WebCrawler:
                     except ValueError:
                         pass
 
+            # Trích xuất kỹ năng
+            skills = []
+            skills_section = soup.select_one(".skills-list")
+            if skills_section:
+                skill_elements = skills_section.select(".skill")
+                for skill_element in skill_elements:
+                    skill = skill_element.text.strip()
+                    if skill:
+                        skills.append(skill)
+
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
+
             # Tạo đối tượng công việc
             from app.models.job import JobData, CompanyInfo, Location, JobType, JobSource, JobRequirement
 
             job = JobData(
+                id=job_id,
                 title=title,
                 description=description,
                 company=CompanyInfo(name=company_name),
@@ -577,11 +755,12 @@ class WebCrawler:
                     country="Việt Nam"
                 ),
                 job_type=JobType.FULL_TIME,
-                requirements=JobRequirement(skills=[]),
+                requirements=JobRequirement(skills=skills),
                 source=JobSource.CAREERBUILDER,
                 source_url=url,
                 deadline=deadline,
-                is_active=True
+                is_active=True,
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 15))  # Ước tính ngày đăng
             )
 
             # Thêm mức lương nếu có
@@ -607,7 +786,7 @@ class WebCrawler:
         Returns:
             Optional[JobData]: Thông tin việc làm
         """
-        # Sử dụng cấu trúc tương tự CareerBuilder
+        # Dùng giống cấu trúc của CareerBuilder
         return await self._crawl_careerbuilder(url, html)
 
     async def _crawl_itviec(self, url: str, html: str) -> Optional[JobData]:
@@ -654,10 +833,14 @@ class WebCrawler:
                 if skill:
                     skills.append(skill)
 
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
+
             # Tạo đối tượng công việc
             from app.models.job import JobData, CompanyInfo, Location, JobType, JobSource, JobRequirement
 
             job = JobData(
+                id=job_id,
                 title=title,
                 description=description,
                 company=CompanyInfo(name=company_name),
@@ -669,7 +852,8 @@ class WebCrawler:
                 requirements=JobRequirement(skills=skills),
                 source=JobSource.OTHER,
                 source_url=url,
-                is_active=True
+                is_active=True,
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 10))  # Ước tính ngày đăng
             )
 
             # Thêm mức lương nếu có
@@ -684,13 +868,16 @@ class WebCrawler:
             logger.error(f"Lỗi khi crawl ITViec {url}: {str(e)}")
             return None
 
-    async def _crawl_generic(self, url: str, html: str) -> Optional[JobData]:
+    async def _crawl_generic(self, url: str, html: str, title: str = "", snippet: str = "", domain: str = "") -> Optional[JobData]:
         """
-        Crawl thông tin từ trang web chung
+        Crawl thông tin từ trang web không được hỗ trợ cụ thể
 
         Args:
             url: URL việc làm
             html: Nội dung HTML
+            title: Tiêu đề kết quả tìm kiếm
+            snippet: Đoạn trích kết quả tìm kiếm
+            domain: Tên miền trang web
 
         Returns:
             Optional[JobData]: Thông tin việc làm
@@ -700,106 +887,137 @@ class WebCrawler:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
 
-            # Trích xuất tiêu đề từ thẻ title
-            title_element = soup.title
-            title = title_element.text.strip() if title_element else ""
+            # Phân tích tiêu đề và công ty
+            parts = title.split(" - ")
+            job_title = parts[0] if len(parts) > 0 else title
+            company_name = parts[1] if len(parts) > 1 else ""
 
-            # Nếu tiêu đề có dạng "Tiêu đề - Công ty", tách thành tiêu đề và tên công ty
-            title_parts = title.split(" - ", 1)
-            job_title = title_parts[0].strip() if title_parts else title
-            company_name = title_parts[1].strip() if len(title_parts) > 1 else ""
-
-            # Trích xuất mô tả
-            description = ""
-
-            # Thử tìm phần tử có id hoặc class chứa "description"
-            desc_selectors = ["#job-description", ".job-description", "#description", ".description",
-                              "#job-detail", ".job-detail", "#content", ".content"]
-
-            for selector in desc_selectors:
-                desc_element = soup.select_one(selector)
-                if desc_element:
-                    description = desc_element.text.strip()
-                    break
-
-            # Nếu không tìm thấy, sử dụng nội dung của thẻ body
-            if not description:
-                body_element = soup.body
-                if body_element:
-                    # Loại bỏ script, style và các thẻ chứa nội dung không liên quan
-                    for script in body_element(["script", "style", "nav", "header", "footer"]):
-                        script.extract()
-
-                    description = body_element.text.strip()
-
-            # Giới hạn độ dài mô tả
-            description = description[:2000] if description else ""
-
-            # Tìm các công ty phổ biến trong nội dung
-            companies = ["FPT", "Viettel", "VNG", "VinFast", "Momo", "Zalo", "Tiki", "Google",
-                         "Microsoft", "Amazon", "IBM", "Samsung", "LG", "Intel", "TMA", "KMS"]
-
-            if not company_name:
-                for company in companies:
-                    if company in description or company in title:
-                        company_name = company
-                        break
-
-            # Tìm các thành phố phổ biến trong nội dung
-            cities = ["Hà Nội", "TP HCM", "TP. HCM", "Hồ Chí Minh", "Đà Nẵng", "Hải Phòng",
-                      "Cần Thơ", "Biên Hòa", "Nha Trang", "Quy Nhơn", "Huế"]
-
-            location_text = ""
-            for city in cities:
-                if city in description or city in title:
-                    location_text = city
-                    break
-
-            # Trích xuất mức lương
-            salary_text = ""
-            salary_patterns = [
-                r'(?:mức lương|lương|salary|income)(?:\s*:)?\s*([\d\s.,]+\s*-\s*[\d\s.,]+)\s*(?:tr|triệu|VND|USD|\$)',
-                r'(?:mức lương|lương|salary|income)(?:\s*:)?\s*([\d\s.,]+)\s*(?:tr|triệu|VND|USD|\$)',
-                r'([\d\s.,]+\s*-\s*[\d\s.,]+)\s*(?:tr|triệu|VND|USD|\$)'
+            # Phân tích địa điểm
+            location_patterns = [
+                r'Địa điểm:?\s*(.+?)[\n\.]',
+                r'Nơi làm việc:?\s*(.+?)[\n\.]',
+                r'Location:?\s*(.+?)[\n\.]',
+                r'Workplace:?\s*(.+?)[\n\.]'
             ]
 
-            for pattern in salary_patterns:
-                match = re.search(pattern, description, re.IGNORECASE)
-                if match:
-                    salary_text = match.group(1)
+            location_text = ""
+            for pattern in location_patterns:
+                location_match = re.search(pattern, html)
+                if location_match:
+                    location_text = location_match.group(1).strip()
                     break
 
-            # Trích xuất kỹ năng phổ biến
-            common_skills = ["Java", "Python", "JavaScript", "C#", "C++", "PHP", "Ruby", "Go", "Swift",
-                             "Kotlin", "React", "Angular", "Vue", "Node.js", "Django", "Flask", "Laravel",
-                             "ASP.NET", "Spring", "SQL", "MongoDB", "AWS", "Azure", "GCP", "Docker",
-                             "Kubernetes", "Linux", "Git", "Agile", "Scrum", "DevOps", "CI/CD", "TDD",
-                             "UI/UX", "HTML", "CSS", "Figma", "Sketch", "Photoshop", "Power BI", "Excel",
-                             "Data Analysis", "Machine Learning", "AI", "Deep Learning", "NLP", "Marketing",
-                             "SEO", "Content", "Social Media", "Google Analytics", "Accounting", "Finance"]
+            # Nếu không tìm thấy địa điểm theo pattern, tìm các thành phố lớn trong nội dung
+            if not location_text:
+                cities = ["Hà Nội", "TP HCM", "TP. HCM", "Hồ Chí Minh", "Đà Nẵng", "Hải Phòng", "Cần Thơ", "Biên Hòa",
+                          "Nha Trang"]
+                for city in cities:
+                    if city in html:
+                        location_text = city
+                        break
 
+            # Phân tích mức lương
+            salary_patterns = [
+                r'Lương:?\s*(.+?)[\n\.]',
+                r'Mức lương:?\s*(.+?)[\n\.]',
+                r'Salary:?\s*(.+?)[\n\.]',
+                r'([\d,\.]+\s*-\s*[\d,\.]+\s*(triệu|tr|million|M))',
+                r'(Lên đến|Up to) (\d[\d\s.,]*\s*(triệu|tr|million|M))'
+            ]
+
+            salary_text = ""
+            for pattern in salary_patterns:
+                salary_match = re.search(pattern, html)
+                if salary_match:
+                    salary_text = salary_match.group(1).strip()
+                    break
+
+            # Phân tích kinh nghiệm
+            exp_patterns = [
+                r'Kinh nghiệm:?\s*(.+?)[\n\.]',
+                r'Yêu cầu kinh nghiệm:?\s*(.+?)[\n\.]',
+                r'Experience:?\s*(.+?)[\n\.]'
+            ]
+
+            exp_text = ""
+            for pattern in exp_patterns:
+                exp_match = re.search(pattern, html)
+                if exp_match:
+                    exp_text = exp_match.group(1).strip()
+                    break
+
+            # Phân tích kỹ năng bằng cách tìm các đoạn văn bản phù hợp
             skills = []
-            for skill in common_skills:
-                if re.search(r'\b' + re.escape(skill) + r'\b', description, re.IGNORECASE):
-                    skills.append(skill)
+            skill_sections = [
+                r'Kỹ năng:?\s*(.*?)(?=Phúc lợi|Quyền lợi|Yêu cầu)',
+                r'Skills:?\s*(.*?)(?=Benefits|Requirements)',
+                r'Yêu cầu:?\s*(.*?)(?=Phúc lợi|Quyền lợi|Mô tả)',
+                r'Requirements:?\s*(.*?)(?=Benefits|Description)'
+            ]
+
+            for pattern in skill_sections:
+                skills_match = re.search(pattern, html, re.DOTALL | re.IGNORECASE)
+                if skills_match:
+                    skills_text = skills_match.group(1)
+                    # Phân tách kỹ năng
+                    skills_raw = re.split(r',|\n|•|\*|-|\.', skills_text)
+                    for skill in skills_raw:
+                        skill = skill.strip()
+                        if skill and len(skill) > 2 and not any(
+                                common in skill.lower() for common in ["yêu cầu", "requirement", "looking for"]):
+                            skills.append(skill)
+                    break
+
+            # Trích xuất deadline
+            deadline = None
+            deadline_patterns = [
+                r'Hạn nộp:?\s*(\d{1,2}/\d{1,2}/\d{4})',
+                r'Deadline:?\s*(\d{1,2}/\d{1,2}/\d{4})'
+            ]
+
+            for pattern in deadline_patterns:
+                deadline_match = re.search(pattern, html)
+                if deadline_match:
+                    try:
+                        deadline = datetime.strptime(deadline_match.group(1), "%d/%m/%Y")
+                        break
+                    except ValueError:
+                        pass
+
+            # Xác định job source
+            job_source = JobSource.OTHER
+            if "linkedin.com" in domain:
+                job_source = JobSource.LINKEDIN
+            elif "topcv.vn" in domain:
+                job_source = JobSource.TOPCV
+            elif "vietnamworks.com" in domain:
+                job_source = JobSource.VIETNAMWORKS
+            elif "careerbuilder.vn" in domain:
+                job_source = JobSource.CAREERBUILDER
+            elif "careerviet.vn" in domain:
+                job_source = JobSource.CAREERVIET
+
+            # Tạo ID duy nhất cho công việc dựa trên URL
+            job_id = hashlib.md5(url.encode()).hexdigest()
 
             # Tạo đối tượng công việc
-            from app.models.job import JobData, CompanyInfo, Location, JobType, JobSource, JobRequirement
-
             job = JobData(
+                id=job_id,
                 title=job_title,
-                description=description,
+                description=snippet or html[:500],
                 company=CompanyInfo(name=company_name),
                 location=Location(
                     city=location_text,
-                    country="Việt Nam" if location_text else None
+                    country="Việt Nam"
                 ),
                 job_type=JobType.FULL_TIME,
                 requirements=JobRequirement(skills=skills),
-                source=JobSource.OTHER,
+                source=job_source,
                 source_url=url,
+                deadline=deadline,
                 is_active=True,
-                raw_text=html[:5000]  # Lưu 5000 ký tự đầu tiên của HTML gốc
+                posted_date=datetime.now() - timedelta(days=random.randint(1, 30)),  # Ước tính ngày đăng
+                raw_text=html[:2000]  # Lưu 2000 ký tự đầu tiên của nội dung gốc
             )
 
             # Thêm mức lương nếu có
@@ -808,11 +1026,31 @@ class WebCrawler:
                 web_searcher = WebSearcher()
                 job.salary = web_searcher._parse_salary(salary_text)
 
+            # Thêm kinh nghiệm nếu có
+            if exp_text:
+                from app.services.job_search.web_search import WebSearcher
+                web_searcher = WebSearcher()
+                job.experience_level = web_searcher._parse_experience(exp_text)
+
             return job
 
         except Exception as e:
             logger.error(f"Lỗi khi crawl URL {url}: {str(e)}")
             return None
+
+    @lru_cache(maxsize=1000)
+    def _get_cache_key(self, url: str) -> str:
+        """
+        Tạo key cache từ URL
+
+        Args:
+            url: URL công việc
+
+        Returns:
+            str: Key cache
+        """
+        # Tạo hash từ URL
+        return hashlib.md5(url.encode("utf-8")).hexdigest()
 
     def _get_from_cache(self, url: str) -> Optional[JobData]:
         """
@@ -839,9 +1077,14 @@ class WebCrawler:
                         job_dict = json.load(f)
 
                     # Chuyển đổi thành đối tượng JobData
-                    from app.models.job import JobData
-                    job = JobData.model_validate(job_dict)
-                    return job
+                    try:
+                        from app.models.job import JobData
+                        job = JobData.model_validate(job_dict)
+                        return job
+                    except Exception as e:
+                        logger.error(f"Lỗi khi chuyển đổi dữ liệu cache: {str(e)}")
+                        # Xóa cache không hợp lệ
+                        os.unlink(cache_path)
             except Exception as e:
                 logger.error(f"Lỗi khi đọc cache: {str(e)}")
 
@@ -872,22 +1115,9 @@ class WebCrawler:
         except Exception as e:
             logger.error(f"Lỗi khi lưu cache: {str(e)}")
 
-    def _get_cache_key(self, url: str) -> str:
-        """
-        Tạo key cache từ URL
-
-        Args:
-            url: URL công việc
-
-        Returns:
-            str: Key cache
-        """
-        # Tạo hash từ URL
-        return hashlib.md5(url.encode("utf-8")).hexdigest()
-
     async def get_company_info(self, company_name: str) -> Optional[CompanyInfo]:
         """
-        Lấy thông tin chi tiết về công ty
+        Lấy thông tin chi tiết về công ty với cơ chế cache
 
         Args:
             company_name: Tên công ty
@@ -895,6 +1125,28 @@ class WebCrawler:
         Returns:
             Optional[CompanyInfo]: Thông tin công ty
         """
+        if not company_name:
+            return None
+
+        # Kiểm tra cache
+        cache_key = f"company_{hashlib.md5(company_name.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=7):  # Cache có hiệu lực trong 7 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        company_dict = json.load(f)
+
+                    # Chuyển đổi thành đối tượng CompanyInfo
+                    from app.models.job import CompanyInfo
+                    return CompanyInfo.model_validate(company_dict)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache công ty: {str(e)}")
+
         # Chức năng này có thể được mở rộng trong tương lai
         from app.models.job import CompanyInfo
 
@@ -908,8 +1160,9 @@ class WebCrawler:
             # Tạo URL tìm kiếm
             search_query = f"{company_name} company vietnam"
 
-            # Thực hiện tìm kiếm
-            import requests
+            # Kiểm tra đảm bảo session đã được khởi tạo
+            if self.session is None or self.session.closed:
+                await self.init_session()
 
             # Chọn ngẫu nhiên User-Agent
             user_agent = random.choice(self.user_agents)
@@ -920,24 +1173,47 @@ class WebCrawler:
 
             # Tìm kiếm trên Google
             search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}"
-            response = requests.get(search_url, headers=headers, timeout=10)
 
-            if response.status_code == 200:
-                # Phân tích HTML
-                from bs4 import BeautifulSoup
-                soup = BeautifulSoup(response.text, "html.parser")
+            async with self.semaphore:
+                async with self.session.get(search_url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        html = await response.text()
 
-                # Tìm các thẻ meta có chứa thông tin về công ty
-                description_element = soup.select_one('div.VwiC3b')
-                if description_element:
-                    company.description = description_element.text.strip()
+                        # Phân tích HTML
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html, "html.parser")
 
-                # Tìm website
-                for link in soup.select('a'):
-                    href = link.get('href', '')
-                    if 'url=' in href and 'google.com' not in href and company_name.lower() in href.lower():
-                        company.website = href.split('url=')[1].split('&')[0]
-                        break
+                        # Tìm các thẻ meta có chứa thông tin về công ty
+                        description_element = soup.select_one('div.VwiC3b')
+                        if description_element:
+                            company.description = description_element.text.strip()
+
+                        # Tìm website
+                        for link in soup.select('a'):
+                            href = link.get('href', '')
+                            if 'url=' in href and 'google.com' not in href and company_name.lower() in href.lower():
+                                company.website = href.split('url=')[1].split('&')[0]
+                                break
+
+                        # Tìm ngành công nghiệp
+                        industry_patterns = [
+                            r'(ngành|industry|sector|lĩnh vực).*?([\w\s,&-]+)',
+                        ]
+
+                        for pattern in industry_patterns:
+                            industry_match = re.search(pattern, html, re.IGNORECASE)
+                            if industry_match:
+                                company.industry = industry_match.group(2).strip()
+                                break
+
+            # Lưu vào cache
+            try:
+                company_dict = company.model_dump()
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(company_dict, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache công ty: {str(e)}")
+
         except Exception as e:
             logger.error(f"Lỗi khi lấy thông tin công ty {company_name}: {str(e)}")
 
@@ -953,6 +1229,24 @@ class WebCrawler:
         Returns:
             Dict[str, Any]: Thông tin chi tiết về công ty
         """
+        if not company_website:
+            return {}
+
+        # Kiểm tra cache
+        cache_key = f"company_details_{hashlib.md5(company_website.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=30):  # Cache có hiệu lực trong 30 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache chi tiết công ty: {str(e)}")
+
         try:
             # Truy cập trang web công ty
             html = await self._fetch_url(company_website)
@@ -1048,6 +1342,13 @@ class WebCrawler:
             if founded_year:
                 company_info["founded_year"] = founded_year
 
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(company_info, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache chi tiết công ty: {str(e)}")
+
             return company_info
 
         except Exception as e:
@@ -1064,6 +1365,25 @@ class WebCrawler:
         Returns:
             int: Số lượng công việc ước tính
         """
+        if not company_name:
+            return 0
+
+        # Kiểm tra cache
+        cache_key = f"job_count_{hashlib.md5(company_name.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=1):  # Cache có hiệu lực trong 1 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        return data.get("count", 0)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache số lượng công việc: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f'"{company_name}" tuyển dụng'
@@ -1078,9 +1398,16 @@ class WebCrawler:
             # Đếm số lượng kết quả có liên quan đến tuyển dụng
             count = 0
             for result in results:
-                if "tuyển dụng" in result.get("body", "").lower() and company_name.lower() in result.get("body",
-                                                                                                         "").lower():
+                body = result.get("body", "").lower()
+                if "tuyển dụng" in body and company_name.lower() in body:
                     count += 1
+
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump({"count": count}, f)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache số lượng công việc: {str(e)}")
 
             return count
 
@@ -1098,6 +1425,24 @@ class WebCrawler:
         Returns:
             Dict[str, Any]: Thông tin về mức lương
         """
+        if not job_title:
+            return {"min": None, "max": None, "average": None, "sources": []}
+
+        # Kiểm tra cache
+        cache_key = f"salary_{hashlib.md5(job_title.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=30):  # Cache có hiệu lực trong 30 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache mức lương: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{job_title} mức lương trung bình"
@@ -1135,10 +1480,13 @@ class WebCrawler:
                             max_part = re.search(r'(\d[\d\s,.]+)', parts[1])
 
                             if min_part and max_part:
-                                min_salary = float(min_part.group(1).replace(" ", "").replace(",", "").replace(".", ""))
-                                max_salary = float(max_part.group(1).replace(" ", "").replace(",", "").replace(".", ""))
+                                min_salary = float(
+                                    min_part.group(1).replace(" ", "").replace(",", "").replace(".", ""))
+                                max_salary = float(
+                                    max_part.group(1).replace(" ", "").replace(",", "").replace(".", ""))
 
-                                if "triệu" in match.group(0) or "tr" in match.group(0) or "million" in match.group(0):
+                                if "triệu" in match.group(0) or "tr" in match.group(0) or "million" in match.group(
+                                        0):
                                     min_salary *= 1000000
                                     max_salary *= 1000000
 
@@ -1151,9 +1499,11 @@ class WebCrawler:
                             # Trường hợp có một mức lương
                             amount_match = re.search(r'(\d[\d\s,.]+)', match.group(0))
                             if amount_match:
-                                amount = float(amount_match.group(1).replace(" ", "").replace(",", "").replace(".", ""))
+                                amount = float(
+                                    amount_match.group(1).replace(" ", "").replace(",", "").replace(".", ""))
 
-                                if "triệu" in match.group(0) or "tr" in match.group(0) or "million" in match.group(0):
+                                if "triệu" in match.group(0) or "tr" in match.group(0) or "million" in match.group(
+                                        0):
                                     amount *= 1000000
 
                                 if "trung bình" in body.lower() or "average" in body.lower():
@@ -1173,6 +1523,13 @@ class WebCrawler:
             if salary_data["average"] is None and salary_data["min"] is not None and salary_data["max"] is not None:
                 salary_data["average"] = (salary_data["min"] + salary_data["max"]) / 2
 
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(salary_data, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache mức lương: {str(e)}")
+
             return salary_data
 
         except Exception as e:
@@ -1189,6 +1546,24 @@ class WebCrawler:
         Returns:
             Dict[str, Any]: Thông tin về xu hướng việc làm
         """
+        if not job_title:
+            return {"demand": None, "growth": None, "competition": None, "keywords": [], "sources": []}
+
+        # Kiểm tra cache
+        cache_key = f"trends_{hashlib.md5(job_title.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=30):  # Cache có hiệu lực trong 30 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache xu hướng việc làm: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{job_title} xu hướng thị trường việc làm"
@@ -1210,7 +1585,8 @@ class WebCrawler:
 
             # Các từ khóa để xác định nhu cầu
             demand_keywords = {
-                "high": ["nhu cầu cao", "nhu cầu lớn", "high demand", "tăng mạnh", "tăng nhanh", "hot", "khan hiếm"],
+                "high": ["nhu cầu cao", "nhu cầu lớn", "high demand", "tăng mạnh", "tăng nhanh", "hot",
+                         "khan hiếm"],
                 "medium": ["nhu cầu ổn định", "stable demand", "vừa phải"],
                 "low": ["nhu cầu thấp", "low demand", "giảm", "suy giảm", "khó khăn"]
             }
@@ -1281,6 +1657,13 @@ class WebCrawler:
             # Giới hạn số lượng từ khóa
             trends["keywords"] = trends["keywords"][:10]
 
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(trends, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache xu hướng việc làm: {str(e)}")
+
             return trends
 
         except Exception as e:
@@ -1297,6 +1680,24 @@ class WebCrawler:
         Returns:
             List[str]: Danh sách các vị trí công việc tương tự
         """
+        if not job_title:
+            return []
+
+        # Kiểm tra cache
+        cache_key = f"similar_jobs_{hashlib.md5(job_title.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=60):  # Cache có hiệu lực trong 60 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f).get("similar_jobs", [])
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache công việc tương tự: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{job_title} vị trí tương tự công việc"
@@ -1345,7 +1746,8 @@ class WebCrawler:
                 default_similar_jobs = {
                     "developer": ["Software Engineer", "Programmer", "Coder", "Full-stack Developer",
                                   "Backend Developer", "Frontend Developer"],
-                    "designer": ["UI Designer", "UX Designer", "Graphic Designer", "Web Designer", "Product Designer"],
+                    "designer": ["UI Designer", "UX Designer", "Graphic Designer", "Web Designer",
+                                 "Product Designer"],
                     "manager": ["Team Lead", "Project Manager", "Product Manager", "Supervisor", "Director"],
                     "marketing": ["Marketing Specialist", "Digital Marketer", "Content Creator", "SEO Specialist",
                                   "Social Media Manager"],
@@ -1364,6 +1766,13 @@ class WebCrawler:
                         similar_jobs = jobs
                         break
 
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump({"similar_jobs": similar_jobs}, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache công việc tương tự: {str(e)}")
+
             # Giới hạn số lượng kết quả
             return similar_jobs[:10]
 
@@ -1381,6 +1790,24 @@ class WebCrawler:
         Returns:
             Dict[str, List[str]]: Danh sách kỹ năng theo danh mục
         """
+        if not job_title:
+            return {"technical": [], "soft": [], "languages": [], "tools": [], "certifications": []}
+
+        # Kiểm tra cache
+        cache_key = f"required_skills_{hashlib.md5(job_title.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=30):  # Cache có hiệu lực trong 30 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache kỹ năng yêu cầu: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{job_title} kỹ năng yêu cầu skills required"
@@ -1411,7 +1838,8 @@ class WebCrawler:
             # Danh sách ngôn ngữ phổ biến
             common_languages = [
                 "English", "Chinese", "Japanese", "Korean", "French", "German", "Spanish", "Russian",
-                "Tiếng Anh", "Tiếng Trung", "Tiếng Nhật", "Tiếng Hàn", "Tiếng Pháp", "Tiếng Đức", "Tiếng Tây Ban Nha",
+                "Tiếng Anh", "Tiếng Trung", "Tiếng Nhật", "Tiếng Hàn", "Tiếng Pháp", "Tiếng Đức",
+                "Tiếng Tây Ban Nha",
                 "Tiếng Nga"
             ]
 
@@ -1465,44 +1893,54 @@ class WebCrawler:
                                 elif "software" in skill.lower() or "tool" in skill.lower() or "công cụ" in skill.lower() or "phần mềm" in skill.lower():
                                     if skill not in skills["tools"]:
                                         skills["tools"].append(skill)
-                                else:
-                                    if skill not in skills["technical"]:
-                                        skills["technical"].append(skill)
+                                    else:
+                                        if skill not in skills["technical"]:
+                                            skills["technical"].append(skill)
 
-            # Nếu không tìm thấy đủ kỹ năng, sử dụng danh sách mặc định
-            if len(skills["technical"]) < 3:
-                # Các kỹ năng kỹ thuật mặc định cho một số ngành nghề phổ biến
-                default_technical_skills = {
-                    "developer": ["Programming", "Coding", "Database", "Web Development", "Software Engineering"],
-                    "designer": ["UI/UX Design", "Graphic Design", "Visual Design", "Layout Design", "Typography"],
-                    "manager": ["Project Management", "Team Management", "Resource Planning", "Budgeting",
-                                "Stakeholder Management"],
-                    "marketing": ["Digital Marketing", "Content Marketing", "SEO", "SEM", "Social Media Marketing"],
-                    "sales": ["Sales Techniques", "Negotiation", "Customer Relationship Management", "Lead Generation",
-                              "Market Research"],
-                    "accountant": ["Financial Analysis", "Bookkeeping", "Tax Planning", "Auditing",
-                                   "Financial Reporting"],
-                    "hr": ["Recruitment", "Employee Relations", "Talent Management", "Performance Management",
-                           "Compensation and Benefits"],
-                    "customer service": ["Customer Support", "Problem Resolution", "Product Knowledge",
-                                         "Conflict Management", "Patience"]
-                }
+                            if len(skills["technical"]) < 3:
+                                # Các kỹ năng kỹ thuật mặc định cho một số ngành nghề phổ biến
+                                default_technical_skills = {
+                                    "developer": ["Programming", "Coding", "Database", "Web Development",
+                                                  "Software Engineering"],
+                                    "designer": ["UI/UX Design", "Graphic Design", "Visual Design", "Layout Design",
+                                                 "Typography"],
+                                    "manager": ["Project Management", "Team Management", "Resource Planning", "Budgeting",
+                                                "Stakeholder Management"],
+                                    "marketing": ["Digital Marketing", "Content Marketing", "SEO", "SEM",
+                                                  "Social Media Marketing"],
+                                    "sales": ["Sales Techniques", "Negotiation", "Customer Relationship Management",
+                                              "Lead Generation",
+                                              "Market Research"],
+                                    "accountant": ["Financial Analysis", "Bookkeeping", "Tax Planning", "Auditing",
+                                                   "Financial Reporting"],
+                                    "hr": ["Recruitment", "Employee Relations", "Talent Management", "Performance Management",
+                                           "Compensation and Benefits"],
+                                    "customer service": ["Customer Support", "Problem Resolution", "Product Knowledge",
+                                                         "Conflict Management", "Patience"]
+                                }
 
-                # Tìm danh sách phù hợp
-                for key, tech_skills in default_technical_skills.items():
-                    if key in job_title.lower():
-                        skills["technical"] = tech_skills
-                        break
+                                # Tìm danh sách phù hợp
+                                for key, tech_skills in default_technical_skills.items():
+                                    if key in job_title.lower():
+                                        skills["technical"] = tech_skills
+                                        break
 
-            # Giới hạn số lượng kỹ năng mỗi danh mục
-            for category in skills:
-                skills[category] = skills[category][:10]
+                            # Giới hạn số lượng kỹ năng mỗi danh mục
+                            for category in skills:
+                                skills[category] = skills[category][:10]
 
-            return skills
+                            # Lưu vào cache
+                            try:
+                                with open(cache_path, "w", encoding="utf-8") as f:
+                                    json.dump(skills, f, ensure_ascii=False, indent=2)
+                            except Exception as e:
+                                logger.error(f"Lỗi khi lưu cache kỹ năng yêu cầu: {str(e)}")
+
+                            return skills
 
         except Exception as e:
             logger.error(f"Lỗi khi thu thập kỹ năng yêu cầu cho {job_title}: {str(e)}")
-            return {"technical": [], "soft": [], "languages": [], "tools": [], "certifications": []}
+        return {"technical": [], "soft": [], "languages": [], "tools": [], "certifications": []}
 
     async def get_company_reviews(self, company_name: str) -> Dict[str, Any]:
         """
@@ -1514,6 +1952,24 @@ class WebCrawler:
         Returns:
             Dict[str, Any]: Thông tin đánh giá về công ty
         """
+        if not company_name:
+            return {"rating": None, "positive": [], "negative": [], "sources": []}
+
+        # Kiểm tra cache
+        cache_key = f"reviews_{hashlib.md5(company_name.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=30):  # Cache có hiệu lực trong 30 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache đánh giá công ty: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{company_name} đánh giá review"
@@ -1600,6 +2056,13 @@ class WebCrawler:
                 if source not in reviews["sources"]:
                     reviews["sources"].append(source)
 
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(reviews, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache đánh giá công ty: {str(e)}")
+
             return reviews
 
         except Exception as e:
@@ -1616,6 +2079,25 @@ class WebCrawler:
         Returns:
             Dict[str, Any]: Thông tin về địa điểm
         """
+        if not location:
+            return {"name": "", "description": "", "district": None, "city": None, "living_cost": None,
+                    "transportation": [], "amenities": []}
+
+        # Kiểm tra cache
+        cache_key = f"location_{hashlib.md5(location.encode()).hexdigest()}"
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_path):
+            try:
+                # Kiểm tra thời gian tạo tệp
+                file_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+                if datetime.now() - file_time < timedelta(days=90):  # Cache có hiệu lực trong 90 ngày
+                    # Đọc dữ liệu cache
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        return json.load(f)
+            except Exception as e:
+                logger.error(f"Lỗi khi đọc cache thông tin địa điểm: {str(e)}")
+
         try:
             # Tạo URL tìm kiếm
             search_query = f"{location} thông tin"
@@ -1697,8 +2179,16 @@ class WebCrawler:
                 for pattern in amenities_patterns:
                     matches = re.findall(pattern, body, re.IGNORECASE)
                     for match in matches:
-                        if match and match not in location_info["amenities"] and len(location_info["amenities"]) < 5:
+                        if match and match not in location_info["amenities"] and len(
+                                location_info["amenities"]) < 5:
                             location_info["amenities"].append(match.strip())
+
+            # Lưu vào cache
+            try:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(location_info, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.error(f"Lỗi khi lưu cache thông tin địa điểm: {str(e)}")
 
             return location_info
 
