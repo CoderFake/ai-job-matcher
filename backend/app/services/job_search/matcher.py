@@ -420,6 +420,9 @@ class JobMatcher:
         if not job_skills:
             return 1.0, [], []
 
+        if not job_skills and not cv_skills:
+            return 1.0, [], []
+
         # Tính toán kỹ năng trùng và kỹ năng thiếu
         matched_skills = []
         missing_skills = []

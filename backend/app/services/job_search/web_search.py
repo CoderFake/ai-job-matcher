@@ -291,12 +291,10 @@ class WebSearcher:
                 page_content = self._fetch_url(url)
 
                 if page_content:
-                    # Phân tích nội dung
                     return parser_func(url, page_content, title, snippet)
                 else:
                     logger.warning(f"Không thể truy cập URL: {url}")
             else:
-                # Trang không được hỗ trợ trực tiếp, sử dụng phân tích chung
                 page_content = self._fetch_url(url)
 
                 if page_content:
@@ -311,15 +309,6 @@ class WebSearcher:
             return None
 
     def _fetch_url(self, url: str) -> Optional[str]:
-        """
-        Truy cập URL để lấy nội dung
-
-        Args:
-            url: URL cần truy cập
-
-        Returns:
-            Optional[str]: Nội dung trang web
-        """
         try:
             import requests
             from bs4 import BeautifulSoup
@@ -335,6 +324,12 @@ class WebSearcher:
                 logger.warning(f"Không thể truy cập URL: {url}, mã trạng thái: {response.status_code}")
                 return None
 
+            # Thêm kiểm tra content-type
+            content_type = response.headers.get("Content-Type", "")
+            if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                logger.warning(f"URL không trả về HTML: {url}, Content-Type: {content_type}")
+                return None
+            
             # Phân tích HTML
             soup = BeautifulSoup(response.text, "html.parser")
 

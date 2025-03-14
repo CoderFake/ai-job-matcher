@@ -47,6 +47,10 @@ class ImageParser:
             import pytesseract
             from PIL import Image
 
+            if not os.path.exists(image_path):
+                logger.error(f"Không tìm thấy tệp ảnh: {image_path}")
+                return ""
+
             # Mở và tiền xử lý ảnh
             image = Image.open(image_path)
 

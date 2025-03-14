@@ -1,7 +1,3 @@
-"""
-API endpoints cho quản lý và phân tích CV
-"""
-
 import os
 import time
 import tempfile
@@ -67,7 +63,17 @@ async def upload_cv(
     Trả về thông tin về tệp đã tải lên và ID để sử dụng trong các API khác.
     """
     try:
-        # Kiểm tra loại tệp
+        file_size = 0
+        content = await file.read(1024 * 1024 * 5)
+        file_size = len(content)
+        if file_size > 1024 * 1024 * 10:
+            raise HTTPException(
+                status_code=413,
+                detail="Kích thước tệp quá lớn. Giới hạn 10MB."
+            )
+
+        await file.seek(0)
+
         file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
 
         supported_extensions = [
@@ -101,9 +107,6 @@ async def upload_cv(
             content = await file.read()
             f.write(content)
 
-        # Lưu thông tin tệp vào bộ nhớ hoặc cơ sở dữ liệu
-        # Trong thực tế, bạn nên lưu vào cơ sở dữ liệu
-        # Ở đây, chúng ta sẽ sử dụng biến toàn cục cho đơn giản
         if not hasattr(router, "uploaded_files"):
             router.uploaded_files = {}
 
@@ -134,16 +137,8 @@ async def analyze_cv(
     request: CVAnalysisRequest,
     background_tasks: BackgroundTasks
 ):
-    """
-    Phân tích CV để trích xuất thông tin.
 
-    - **cv_id**: ID của CV đã tải lên
-    - **use_llm**: Sử dụng LLM để phân tích (mặc định là True)
-
-    Trả về thông tin đã phân tích từ CV.
-    """
     try:
-        # Kiểm tra xem CV có tồn tại không
         if not hasattr(router, "uploaded_files") or request.cv_id not in router.uploaded_files:
             raise HTTPException(
                 status_code=404,
@@ -156,6 +151,12 @@ async def analyze_cv(
 
         # Bắt đầu tính thời gian xử lý
         start_time = time.time()
+
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy tệp CV: {file_path}"
+            )
 
         # Phân tích CV
         cv_data = cv_extractor.process_cv_file(file_path, use_llm=request.use_llm)

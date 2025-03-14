@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.endpoints import cv, jobs, users
+from .endpoints import cv, jobs, users
 
 # Tạo router API chính
 api_router = APIRouter()

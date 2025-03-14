@@ -140,17 +140,6 @@ class LocalLLM:
             return False
 
     def generate(self, prompt: str, max_tokens: int = 2048, temperature: float = 0.7) -> str:
-        """
-        Tạo văn bản dựa trên prompt
-
-        Args:
-            prompt: Lời nhắc
-            max_tokens: Số lượng token tối đa
-            temperature: Nhiệt độ (độ sáng tạo)
-
-        Returns:
-            str: Văn bản được tạo
-        """
         try:
             if self.model_type == "ollama":
                 return self._generate_with_ollama(prompt, max_tokens, temperature)
@@ -159,7 +148,6 @@ class LocalLLM:
             elif self.model_type == "transformers":
                 return self._generate_with_transformers(prompt, max_tokens, temperature)
             else:
-                # Sử dụng mô phỏng đơn giản nếu không có mô hình nào khả dụng
                 return self._generate_mock(prompt)
 
         except Exception as e:
@@ -260,8 +248,8 @@ class LocalLLM:
             from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
             # Khởi tạo pipeline nếu chưa có
-            if not hasattr(self, "pipe"):
-                model_id = "google/gemma-2b-it"  # Mô hình nhỏ để chạy được trên nhiều GPU
+            if not hasattr(self, "pipe") or self.pipe is None:
+                model_id = "google/gemma-2b-it"
 
                 # Sử dụng BF16 nếu GPU hỗ trợ, không thì dùng FP16
                 if torch.cuda.is_bf16_supported():
