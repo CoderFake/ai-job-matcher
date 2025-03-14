@@ -13,6 +13,8 @@ import json
 import hashlib
 from datetime import datetime, timedelta
 
+from pydantic import ValidationError
+
 from app.core.logging import get_logger
 from app.core.settings import settings
 from app.models.job import JobData, CompanyInfo, Location, SalaryRange, JobRequirement, JobType, ExperienceLevel, \
@@ -1028,4 +1030,332 @@ class WebSearcher:
                             job = JobData.model_validate(job_dict)
                             jobs.append(job)
                         except Exception as e:
-                            """
+                            return jobs
+
+                    return jobs
+
+            except Exception as e:
+                logger.error(f"Lỗi khi chuyển đổi dữ liệu cache: {str(e)}")
+                return None
+
+    def _save_to_cache(self, query: str, jobs: List[JobData]) -> None:
+        """
+        Lưu kết quả vào cache
+
+        Args:
+            query: Chuỗi tìm kiếm
+            jobs: Danh sách công việc
+        """
+        # Tạo key cache từ query
+        cache_key = self._get_cache_key(query)
+        cache_path = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        try:
+            # Chuyển đổi danh sách JobData thành JSON
+            job_dicts = []
+            for job in jobs:
+                job_dict = job.model_dump()
+                job_dicts.append(job_dict)
+
+            # Ghi vào tệp cache
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(job_dicts, f, ensure_ascii=False, indent=2)
+
+            logger.info(f"Đã lưu {len(jobs)} công việc vào cache: {cache_key}")
+
+        except Exception as e:
+            logger.error(f"Lỗi khi lưu cache: {str(e)}")
+
+    def _get_cache_key(self, query: str) -> str:
+        """
+        Tạo key cache từ query
+
+        Args:
+            query: Chuỗi tìm kiếm
+
+        Returns:
+            str: Key cache
+        """
+        # Tạo hash từ query
+        import hashlib
+        return hashlib.md5(query.encode("utf-8")).hexdigest()
+
+    def filter_jobs(self, jobs: List[JobData], filters: Dict[str, Any]) -> List[JobData]:
+        """
+        Lọc danh sách công việc theo các tiêu chí
+
+        Args:
+            jobs: Danh sách công việc cần lọc
+            filters: Các tiêu chí lọc
+
+        Returns:
+            List[JobData]: Danh sách công việc đã lọc
+        """
+        filtered_jobs = jobs.copy()
+
+        # Lọc theo loại công việc
+        if "job_type" in filters and filters["job_type"]:
+            job_types = filters["job_type"] if isinstance(filters["job_type"], list) else [filters["job_type"]]
+            filtered_jobs = [job for job in filtered_jobs if job.job_type in job_types]
+
+        # Lọc theo cấp độ kinh nghiệm
+        if "experience_level" in filters and filters["experience_level"]:
+            exp_levels = filters["experience_level"] if isinstance(filters["experience_level"], list) else [
+                filters["experience_level"]]
+            filtered_jobs = [job for job in filtered_jobs if job.experience_level in exp_levels]
+
+        # Lọc theo địa điểm
+        if "location" in filters and filters["location"]:
+            locations = filters["location"] if isinstance(filters["location"], list) else [filters["location"]]
+            filtered_jobs = [job for job in filtered_jobs if
+                             job.location and job.location.city and any(
+                                 location.lower() in job.location.city.lower() for location in locations)]
+
+        # Lọc theo công ty
+        if "company" in filters and filters["company"]:
+            companies = filters["company"] if isinstance(filters["company"], list) else [filters["company"]]
+            filtered_jobs = [job for job in filtered_jobs if
+                             job.company and job.company.name and any(
+                                 company.lower() in job.company.name.lower() for company in companies)]
+
+        # Lọc theo kỹ năng
+        if "skills" in filters and filters["skills"]:
+            skills = filters["skills"] if isinstance(filters["skills"], list) else [filters["skills"]]
+            filtered_jobs = [job for job in filtered_jobs if
+                             job.requirements and job.requirements.skills and any(
+                                 any(skill.lower() in job_skill.lower() for job_skill in job.requirements.skills) for
+                                 skill in skills)]
+
+        # Lọc theo mức lương
+        if "salary_min" in filters and filters["salary_min"]:
+            min_salary = float(filters["salary_min"])
+            filtered_jobs = [job for job in filtered_jobs if
+                             job.salary and job.salary.min and job.salary.min >= min_salary]
+
+        if "salary_max" in filters and filters["salary_max"]:
+            max_salary = float(filters["salary_max"])
+            filtered_jobs = [job for job in filtered_jobs if
+                             job.salary and job.salary.max and job.salary.max <= max_salary]
+
+        # Lọc theo ngày đăng
+        if "posted_after" in filters and filters["posted_after"]:
+            from datetime import datetime
+            posted_after = datetime.fromisoformat(filters["posted_after"])
+            filtered_jobs = [job for job in filtered_jobs if job.posted_date and job.posted_date >= posted_after]
+
+        return filtered_jobs
+
+    def rank_jobs(self, jobs: List[JobData], criteria: Dict[str, float]) -> List[Tuple[JobData, float]]:
+        """
+        Xếp hạng danh sách công việc theo các tiêu chí
+
+        Args:
+            jobs: Danh sách công việc cần xếp hạng
+            criteria: Các tiêu chí xếp hạng và trọng số tương ứng
+
+        Returns:
+            List[Tuple[JobData, float]]: Danh sách công việc và điểm số tương ứng
+        """
+        results = []
+
+        # Tính điểm cho từng công việc
+        for job in jobs:
+            score = 0.0
+
+            # Tính điểm theo từng tiêu chí
+            for criterion, weight in criteria.items():
+                if criterion == "salary":
+                    # Điểm cho mức lương
+                    if job.salary and job.salary.is_disclosed:
+                        if job.salary.min is not None and job.salary.max is not None:
+                            # Sử dụng mức lương trung bình
+                            score += weight * (job.salary.min + job.salary.max) / 2 / 1000000  # Chuyển về đơn vị triệu
+                        elif job.salary.min is not None:
+                            score += weight * job.salary.min / 1000000
+                        elif job.salary.max is not None:
+                            score += weight * job.salary.max / 1000000
+                elif criterion == "location" and "preferred_location" in criteria:
+                    # Điểm cho địa điểm
+                    preferred_location = criteria["preferred_location"]
+                    if job.location and job.location.city and preferred_location:
+                        if preferred_location.lower() in job.location.city.lower():
+                            score += weight
+                elif criterion == "experience_match" and "experience_level" in criteria:
+                    # Điểm cho kinh nghiệm
+                    preferred_level = criteria["experience_level"]
+                    if job.experience_level and preferred_level:
+                        if job.experience_level == preferred_level:
+                            score += weight
+                elif criterion == "skills_match" and "skills" in criteria:
+                    # Điểm cho kỹ năng
+                    preferred_skills = criteria["skills"] if isinstance(criteria["skills"], list) else [
+                        criteria["skills"]]
+                    if job.requirements and job.requirements.skills:
+                        match_count = sum(
+                            1 for skill in preferred_skills if any(
+                                skill.lower() in job_skill.lower() for job_skill in job.requirements.skills))
+                        if preferred_skills:
+                            score += weight * match_count / len(preferred_skills)
+                elif criterion == "company_reputation":
+                    # Điểm cho uy tín công ty
+                    # Đơn giản hóa: giả sử các công ty lớn có tên ngắn hơn 5 ký tự là có uy tín cao
+                    if job.company and job.company.name:
+                        if len(job.company.name) < 5:
+                            score += weight
+                elif criterion == "recent":
+                    # Điểm cho tính mới
+                    if job.posted_date:
+                        from datetime import datetime
+                        days_old = (datetime.now() - job.posted_date).days
+                        if days_old <= 7:  # Trong vòng 1 tuần
+                            score += weight
+                        elif days_old <= 30:  # Trong vòng 1 tháng
+                            score += weight * 0.5
+
+            # Thêm vào kết quả
+            results.append((job, score))
+
+        # Sắp xếp theo điểm số giảm dần
+        results.sort(key=lambda x: x[1], reverse=True)
+
+        return results
+
+    def find_similar_jobs(self, job: JobData, all_jobs: List[JobData], limit: int = 5) -> List[JobData]:
+        """
+        Tìm các công việc tương tự với một công việc cụ thể
+
+        Args:
+            job: Công việc cần tìm
+            all_jobs: Danh sách tất cả các công việc
+            limit: Số lượng kết quả tối đa
+
+        Returns:
+            List[JobData]: Danh sách các công việc tương tự
+        """
+        if not job or not all_jobs:
+            return []
+
+        # Tính điểm tương đồng cho từng công việc
+        similarities = []
+
+        for other_job in all_jobs:
+            # Không so sánh với chính nó
+            if other_job.id == job.id:
+                continue
+
+            # Tính điểm tương đồng
+            similarity_score = 0.0
+
+            # Tiêu đề công việc (trọng số cao)
+            if job.title and other_job.title:
+                title_similarity = self._calculate_text_similarity(job.title, other_job.title)
+                similarity_score += title_similarity * 0.4
+
+            # Kỹ năng yêu cầu
+            if job.requirements and job.requirements.skills and other_job.requirements and other_job.requirements.skills:
+                skill_similarity = self._calculate_list_similarity(job.requirements.skills,
+                                                                   other_job.requirements.skills)
+                similarity_score += skill_similarity * 0.3
+
+            # Cấp độ kinh nghiệm
+            if job.experience_level and other_job.experience_level and job.experience_level == other_job.experience_level:
+                similarity_score += 0.15
+
+            # Loại công việc
+            if job.job_type and other_job.job_type and job.job_type == other_job.job_type:
+                similarity_score += 0.1
+
+            # Địa điểm
+            if job.location and job.location.city and other_job.location and other_job.location.city:
+                if job.location.city.lower() == other_job.location.city.lower():
+                    similarity_score += 0.05
+
+            # Thêm vào danh sách
+            similarities.append((other_job, similarity_score))
+
+        # Sắp xếp theo điểm tương đồng giảm dần
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        # Trả về danh sách các công việc tương tự
+        return [sim[0] for sim in similarities[:limit]]
+
+    def _calculate_text_similarity(self, text1: str, text2: str) -> float:
+        """
+        Tính toán độ tương đồng giữa hai chuỗi văn bản
+
+        Args:
+            text1: Chuỗi thứ nhất
+            text2: Chuỗi thứ hai
+
+        Returns:
+            float: Điểm tương đồng (0-1)
+        """
+        # Chuẩn hóa văn bản
+        text1 = text1.lower()
+        text2 = text2.lower()
+
+        # Chia thành các từ
+        words1 = set(re.findall(r'\w+', text1))
+        words2 = set(re.findall(r'\w+', text2))
+
+        # Tính độ tương đồng Jaccard
+        if not words1 or not words2:
+            return 0.0
+
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+
+        return intersection / union
+
+    def _calculate_list_similarity(self, list1: List[str], list2: List[str]) -> float:
+        """
+        Tính toán độ tương đồng giữa hai danh sách chuỗi
+
+        Args:
+            list1: Danh sách thứ nhất
+            list2: Danh sách thứ hai
+
+        Returns:
+            float: Điểm tương đồng (0-1)
+        """
+        # Chuẩn hóa các chuỗi
+        norm_list1 = [item.lower() for item in list1]
+        norm_list2 = [item.lower() for item in list2]
+
+        # Đếm số lượng phần tử xuất hiện trong cả hai danh sách
+        common_count = sum(
+            1 for item1 in norm_list1 if any(self._is_similar_text(item1, item2) for item2 in norm_list2))
+
+        # Tính độ tương đồng
+        return common_count / max(len(norm_list1), len(norm_list2)) if max(len(norm_list1),
+                                                                           len(norm_list2)) > 0 else 0.0
+
+    def _is_similar_text(self, text1: str, text2: str) -> bool:
+        """
+        Kiểm tra xem hai chuỗi có tương tự nhau không
+
+        Args:
+            text1: Chuỗi thứ nhất
+            text2: Chuỗi thứ hai
+
+        Returns:
+            bool: True nếu hai chuỗi tương tự nhau
+        """
+        # Kiểm tra chính xác
+        if text1 == text2:
+            return True
+
+        # Kiểm tra bao hàm
+        if text1 in text2 or text2 in text1:
+            return True
+
+        # Kiểm tra độ tương đồng từ
+        words1 = set(re.findall(r'\w+', text1))
+        words2 = set(re.findall(r'\w+', text2))
+
+        # Nếu ít nhất 50% số từ trùng nhau
+        if not words1 or not words2:
+            return False
+
+        intersection = len(words1.intersection(words2))
+        return intersection / min(len(words1), len(words2)) >= 0.5

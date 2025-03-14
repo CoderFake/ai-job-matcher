@@ -132,6 +132,21 @@ class CVExtractor:
                 logger.error("Văn bản CV quá ngắn hoặc rỗng")
                 return self._create_empty_cv_data(file_source)
 
+            if use_llm:
+                # Sử dụng LLM để phân tích
+                cv_data = self._extract_with_llm(text, file_source)
+            else:
+                # Sử dụng phương pháp truyền thống (regex, rules)
+                cv_data = self._extract_with_rules(text, file_source)
+
+            # Thêm văn bản gốc
+            cv_data.raw_text = text
+
+            return cv_data
+        except Exception as e:
+            logger.error(f"Lỗi khi phân tích CV từ văn bản: {str(e)}")
+            return self._create_empty_cv_data(file_source)
+
     def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
         """
         Phân tích chuỗi ngày tháng thành đối tượng datetime
@@ -318,21 +333,6 @@ class CVExtractor:
         except Exception as e:
             logger.error(f"Lỗi khi nâng cao dữ liệu CV: {str(e)}")
             return cv_data
-
-            if use_llm:
-                # Sử dụng LLM để phân tích
-                cv_data = self._extract_with_llm(text, file_source)
-            else:
-                # Sử dụng phương pháp truyền thống (regex, rules)
-                cv_data = self._extract_with_rules(text, file_source)
-
-            # Thêm văn bản gốc
-            cv_data.raw_text = text
-
-            return cv_data
-        except Exception as e:
-            logger.error(f"Lỗi khi phân tích CV từ văn bản: {str(e)}")
-            return self._create_empty_cv_data(file_source)
 
     def _extract_with_llm(self, text: str, file_source: str = None) -> CVData:
         """
