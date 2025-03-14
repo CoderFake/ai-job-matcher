@@ -2,22 +2,51 @@ import os
 import time
 import tempfile
 import logging
+import shutil
+import uuid
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 from app.core.logging import get_logger
 from app.models.cv import CVData, PersonalInfo
 from app.services.cv_parser.extract import CVExtractor
+from app.services.llm import LocalLLM
 
 logger = get_logger("api")
 router = APIRouter()
 
 # Khởi tạo bộ trích xuất CV
 cv_extractor = CVExtractor()
+
+# Kích thước file tối đa (10MB)
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+# Danh sách các định dạng tệp hỗ trợ
+SUPPORTED_EXTENSIONS = {
+    # PDF
+    ".pdf": "application/pdf",
+    # Word
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".rtf": "application/rtf",
+    # Excel
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv": "text/csv",
+    # Hình ảnh
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+    ".tif": "image/tiff",
+    ".webp": "image/webp"
+}
+
 
 class CVUploadResponse(BaseModel):
     """Phản hồi khi tải lên CV"""
@@ -27,10 +56,12 @@ class CVUploadResponse(BaseModel):
     status: str = Field(..., description="Trạng thái xử lý")
     message: str = Field(..., description="Thông báo")
 
+
 class CVAnalysisRequest(BaseModel):
     """Yêu cầu phân tích CV"""
     cv_id: str = Field(..., description="ID của CV đã tải lên")
     use_llm: bool = Field(True, description="Sử dụng LLM để phân tích")
+
 
 class CVAnalysisResponse(BaseModel):
     """Phản hồi khi phân tích CV"""
@@ -40,9 +71,11 @@ class CVAnalysisResponse(BaseModel):
     message: str = Field(..., description="Thông báo")
     processing_time: float = Field(..., description="Thời gian xử lý (giây)")
 
+
 class CVExtractTextRequest(BaseModel):
     """Yêu cầu trích xuất văn bản từ CV"""
     cv_id: str = Field(..., description="ID của CV đã tải lên")
+
 
 class CVExtractTextResponse(BaseModel):
     """Phản hồi khi trích xuất văn bản từ CV"""
@@ -51,9 +84,11 @@ class CVExtractTextResponse(BaseModel):
     content_type: str = Field(..., description="Loại nội dung")
     file_name: str = Field(..., description="Tên tệp gốc")
 
+
 @router.post("/upload", response_model=CVUploadResponse, summary="Tải lên CV")
 async def upload_cv(
-    file: UploadFile = File(..., description="Tệp CV (PDF, Word, Excel, hình ảnh)")
+        file: UploadFile = File(..., description="Tệp CV (PDF, Word, Excel, hình ảnh)"),
+        background_tasks: BackgroundTasks = None
 ):
     """
     Tải lên tệp CV để phân tích.
@@ -63,82 +98,145 @@ async def upload_cv(
     Trả về thông tin về tệp đã tải lên và ID để sử dụng trong các API khác.
     """
     try:
-        file_size = 0
-        content = await file.read(1024 * 1024 * 5)
-        file_size = len(content)
-        if file_size > 1024 * 1024 * 10:
-            raise HTTPException(
-                status_code=413,
-                detail="Kích thước tệp quá lớn. Giới hạn 10MB."
-            )
+        # Kiểm tra kích thước tệp
+        try:
+            file_size = 0
+            content = await file.read(1024 * 1024)  # Đọc 1MB đầu tiên
+            file_size = len(content)
 
-        await file.seek(0)
+            while content:
+                if file_size > MAX_FILE_SIZE:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Kích thước tệp quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB."
+                    )
+                content = await file.read(1024 * 1024)  # Đọc tiếp 1MB
+                if content:
+                    file_size += len(content)
 
+            # Reset file pointer
+            await file.seek(0)
+        except Exception as e:
+            if "file_size" in locals() and file_size > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Kích thước tệp quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB."
+                )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Lỗi khi kiểm tra kích thước tệp: {str(e)}"
+                )
+
+        # Kiểm tra định dạng tệp
         file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
-
-        supported_extensions = [
-            # PDF
-            ".pdf",
-            # Word
-            ".doc", ".docx", ".rtf",
-            # Excel
-            ".xls", ".xlsx", ".csv",
-            # Hình ảnh
-            ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"
-        ]
-
-        if file_ext not in supported_extensions:
+        if file_ext not in SUPPORTED_EXTENSIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Không hỗ trợ loại tệp {file_ext}. Hỗ trợ các định dạng: {', '.join(supported_extensions)}"
+                detail=f"Không hỗ trợ loại tệp {file_ext}. Hỗ trợ các định dạng: {', '.join(SUPPORTED_EXTENSIONS.keys())}"
             )
 
-        # Tạo thư mục tạm thời để lưu tệp
-        upload_dir = tempfile.mkdtemp()
+        # Tạo thư mục tạm thời để lưu tệp nếu chưa có
+        upload_dir = Path(tempfile.gettempdir()) / "ai_job_matcher_uploads"
+        upload_dir.mkdir(exist_ok=True)
 
-        # Tạo ID cho CV dựa trên timestamp và tên tệp
-        cv_id = f"{int(time.time())}_{os.path.splitext(file.filename)[0]}"
-        cv_id = cv_id.replace(" ", "_")
+        # Tạo ID cho CV dựa trên timestamp và UUID
+        cv_id = f"{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+        # Xử lý tên tệp để tránh các ký tự không hợp lệ
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in "._- ").strip()
+        if not safe_filename:
+            safe_filename = f"uploaded_file{file_ext}"
+
+        # Tạo đường dẫn tệp cuối cùng
+        file_path = upload_dir / f"{cv_id}_{safe_filename}"
 
         # Lưu tệp
-        file_path = os.path.join(upload_dir, file.filename)
-
         with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            # Đọc và ghi theo từng phần
+            chunk_size = 1024 * 1024  # 1MB
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
 
+        # Ghi log
+        logger.info(f"Đã tải lên CV: {file.filename} -> {file_path} ({file_size} bytes)")
+
+        # Lưu thông tin tệp để sử dụng sau này
         if not hasattr(router, "uploaded_files"):
             router.uploaded_files = {}
 
         router.uploaded_files[cv_id] = {
-            "file_path": file_path,
+            "file_path": str(file_path),
             "file_name": file.filename,
-            "content_type": file.content_type,
-            "upload_time": time.time()
+            "content_type": file.content_type or SUPPORTED_EXTENSIONS.get(file_ext, "application/octet-stream"),
+            "upload_time": time.time(),
+            "file_size": file_size
         }
+
+        # Thêm nhiệm vụ xóa tệp cũ vào background (tệp đã quá 24 giờ)
+        if background_tasks:
+            background_tasks.add_task(cleanup_old_files, upload_dir)
 
         return CVUploadResponse(
             cv_id=cv_id,
             file_name=file.filename,
-            content_type=file.content_type,
+            content_type=file.content_type or SUPPORTED_EXTENSIONS.get(file_ext, "application/octet-stream"),
             status="success",
             message="Tệp đã được tải lên thành công"
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi tải lên CV: {str(e)}")
+        logger.error(f"Lỗi khi tải lên CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi tải lên CV: {str(e)}"
         )
 
+
+def cleanup_old_files(directory: Path, max_age_hours: int = 24):
+    """
+    Xóa các tệp tạm thời cũ
+
+    Args:
+        directory: Thư mục chứa tệp
+        max_age_hours: Thời gian tối đa (giờ) để giữ tệp
+    """
+    try:
+        current_time = time.time()
+        max_age_seconds = max_age_hours * 3600
+
+        # Kiểm tra từng tệp trong thư mục
+        for file_path in directory.glob("*"):
+            if file_path.is_file():
+                file_age = current_time - os.path.getmtime(file_path)
+                if file_age > max_age_seconds:
+                    os.unlink(file_path)
+                    logger.info(f"Đã xóa tệp cũ: {file_path}")
+    except Exception as e:
+        logger.error(f"Lỗi khi dọn dẹp tệp cũ: {str(e)}")
+
+
 @router.post("/analyze", response_model=CVAnalysisResponse, summary="Phân tích CV")
 async def analyze_cv(
-    request: CVAnalysisRequest,
-    background_tasks: BackgroundTasks
+        request: CVAnalysisRequest,
+        background_tasks: BackgroundTasks = None
 ):
+    """
+    Phân tích CV đã tải lên.
 
+    - **cv_id**: ID của CV đã tải lên
+    - **use_llm**: Sử dụng LLM để phân tích (mặc định là True)
+
+    Trả về dữ liệu CV đã phân tích.
+    """
     try:
+        # Kiểm tra xem CV có tồn tại không
         if not hasattr(router, "uploaded_files") or request.cv_id not in router.uploaded_files:
             raise HTTPException(
                 status_code=404,
@@ -152,6 +250,7 @@ async def analyze_cv(
         # Bắt đầu tính thời gian xử lý
         start_time = time.time()
 
+        # Kiểm tra tệp
         if not os.path.exists(file_path):
             raise HTTPException(
                 status_code=404,
@@ -164,7 +263,7 @@ async def analyze_cv(
         # Nâng cao dữ liệu CV
         cv_data = cv_extractor.enhance_cv_data(cv_data)
 
-        # Lưu kết quả phân tích vào bộ nhớ hoặc cơ sở dữ liệu
+        # Lưu kết quả phân tích vào bộ nhớ
         if not hasattr(router, "analyzed_cvs"):
             router.analyzed_cvs = {}
 
@@ -172,6 +271,10 @@ async def analyze_cv(
 
         # Tính thời gian xử lý
         processing_time = time.time() - start_time
+
+        # Nếu background_tasks không None, thêm nhiệm vụ xóa các kết quả phân tích cũ
+        if background_tasks:
+            background_tasks.add_task(cleanup_old_analyses)
 
         return CVAnalysisResponse(
             cv_id=request.cv_id,
@@ -181,16 +284,50 @@ async def analyze_cv(
             processing_time=processing_time
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi phân tích CV: {str(e)}")
+        logger.error(f"Lỗi khi phân tích CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi phân tích CV: {str(e)}"
         )
 
+
+def cleanup_old_analyses(max_count: int = 100):
+    """
+    Xóa các kết quả phân tích cũ để tránh sử dụng quá nhiều bộ nhớ
+
+    Args:
+        max_count: Số lượng kết quả tối đa cần giữ lại
+    """
+    try:
+        if hasattr(router, "analyzed_cvs") and len(router.analyzed_cvs) > max_count:
+            # Lấy danh sách CV ID và thời gian tải lên
+            cv_times = []
+            for cv_id, _ in router.analyzed_cvs.items():
+                if cv_id in router.uploaded_files:
+                    cv_times.append((cv_id, router.uploaded_files[cv_id]["upload_time"]))
+                else:
+                    # Nếu không có thông tin tải lên, sử dụng thời gian 0
+                    cv_times.append((cv_id, 0))
+
+            # Sắp xếp theo thời gian (cũ nhất trước)
+            cv_times.sort(key=lambda x: x[1])
+
+            # Xóa các kết quả cũ
+            for cv_id, _ in cv_times[:len(cv_times) - max_count]:
+                if cv_id in router.analyzed_cvs:
+                    del router.analyzed_cvs[cv_id]
+                    logger.info(f"Đã xóa kết quả phân tích cũ cho CV ID: {cv_id}")
+    except Exception as e:
+        logger.error(f"Lỗi khi dọn dẹp kết quả phân tích cũ: {str(e)}")
+
+
 @router.post("/extract-text", response_model=CVExtractTextResponse, summary="Trích xuất văn bản từ CV")
 async def extract_text_from_cv(
-    request: CVExtractTextRequest
+        request: CVExtractTextRequest
 ):
     """
     Trích xuất văn bản thô từ CV.
@@ -211,9 +348,17 @@ async def extract_text_from_cv(
         file_info = router.uploaded_files[request.cv_id]
         file_path = file_info["file_path"]
 
+        # Kiểm tra tệp
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy tệp CV: {file_path}"
+            )
+
         # Trích xuất văn bản
         text, file_type = cv_extractor.extract_text_from_file(file_path)
 
+        # Trả về văn bản đã trích xuất
         return CVExtractTextResponse(
             cv_id=request.cv_id,
             text=text,
@@ -221,16 +366,20 @@ async def extract_text_from_cv(
             file_name=file_info["file_name"]
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi trích xuất văn bản từ CV: {str(e)}")
+        logger.error(f"Lỗi khi trích xuất văn bản từ CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi trích xuất văn bản từ CV: {str(e)}"
         )
 
+
 @router.get("/info/{cv_id}", response_model=Dict[str, Any], summary="Lấy thông tin về CV")
 async def get_cv_info(
-    cv_id: str
+        cv_id: str
 ):
     """
     Lấy thông tin về CV đã tải lên.
@@ -250,6 +399,11 @@ async def get_cv_info(
         # Lấy thông tin tệp
         file_info = router.uploaded_files[cv_id]
 
+        # Kiểm tra tệp
+        file_path = file_info["file_path"]
+        file_exists = os.path.exists(file_path)
+        file_size = os.path.getsize(file_path) if file_exists else 0
+
         # Lấy thông tin phân tích nếu có
         cv_data = None
         if hasattr(router, "analyzed_cvs") and cv_id in router.analyzed_cvs:
@@ -261,15 +415,21 @@ async def get_cv_info(
             "content_type": file_info["content_type"],
             "upload_time": file_info["upload_time"],
             "is_analyzed": cv_data is not None,
-            "file_size": os.path.getsize(file_info["file_path"])
+            "file_exists": file_exists,
+            "file_size": file_size,
+            "file_path": file_path if file_exists else None
         }
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi lấy thông tin CV: {str(e)}")
+        logger.error(f"Lỗi khi lấy thông tin CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi lấy thông tin CV: {str(e)}"
         )
+
 
 @router.get("/list", response_model=List[Dict[str, Any]], summary="Liệt kê các CV đã tải lên")
 async def list_cvs():
@@ -284,6 +444,11 @@ async def list_cvs():
 
         cv_list = []
         for cv_id, file_info in router.uploaded_files.items():
+            # Kiểm tra xem tệp có tồn tại không
+            file_path = file_info["file_path"]
+            file_exists = os.path.exists(file_path)
+
+            # Kiểm tra xem CV đã được phân tích chưa
             is_analyzed = hasattr(router, "analyzed_cvs") and cv_id in router.analyzed_cvs
 
             cv_list.append({
@@ -291,7 +456,8 @@ async def list_cvs():
                 "file_name": file_info["file_name"],
                 "content_type": file_info["content_type"],
                 "upload_time": file_info["upload_time"],
-                "is_analyzed": is_analyzed
+                "is_analyzed": is_analyzed,
+                "file_exists": file_exists
             })
 
         # Sắp xếp theo thời gian tải lên giảm dần (mới nhất trước)
@@ -300,15 +466,16 @@ async def list_cvs():
         return cv_list
 
     except Exception as e:
-        logger.error(f"Lỗi khi liệt kê CV: {str(e)}")
+        logger.error(f"Lỗi khi liệt kê CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi liệt kê CV: {str(e)}"
         )
 
+
 @router.delete("/{cv_id}", response_model=Dict[str, Any], summary="Xóa CV")
 async def delete_cv(
-    cv_id: str
+        cv_id: str
 ):
     """
     Xóa CV đã tải lên.
@@ -329,16 +496,18 @@ async def delete_cv(
         file_info = router.uploaded_files[cv_id]
         file_path = file_info["file_path"]
 
-        # Xóa tệp
+        # Xóa tệp nếu tồn tại
         if os.path.exists(file_path):
-            os.remove(file_path)
+            os.unlink(file_path)
+            logger.info(f"Đã xóa tệp: {file_path}")
 
         # Xóa thông tin tệp
         deleted_info = router.uploaded_files.pop(cv_id)
 
         # Xóa thông tin phân tích nếu có
         if hasattr(router, "analyzed_cvs") and cv_id in router.analyzed_cvs:
-            router.analyzed_cvs.pop(cv_id)
+            del router.analyzed_cvs[cv_id]
+            logger.info(f"Đã xóa kết quả phân tích cho CV ID: {cv_id}")
 
         return {
             "cv_id": cv_id,
@@ -347,17 +516,21 @@ async def delete_cv(
             "message": "CV đã được xóa thành công"
         }
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi xóa CV: {str(e)}")
+        logger.error(f"Lỗi khi xóa CV: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi xóa CV: {str(e)}"
         )
 
+
 @router.post("/image-analysis", response_model=Dict[str, Any], summary="Phân tích CV từ hình ảnh")
 async def analyze_cv_image(
-    file: UploadFile = File(..., description="Hình ảnh CV"),
-    use_llm: bool = Form(True, description="Sử dụng LLM để phân tích")
+        file: UploadFile = File(..., description="Hình ảnh CV"),
+        use_llm: bool = Form(True, description="Sử dụng LLM để phân tích")
 ):
     """
     Phân tích CV từ hình ảnh.
@@ -368,85 +541,98 @@ async def analyze_cv_image(
     Trả về thông tin đã phân tích từ hình ảnh CV.
     """
     try:
-        # Kiểm tra loại tệp
+        # Kiểm tra định dạng hình ảnh
         file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
+        supported_image_formats = [".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"]
 
-        supported_extensions = [
-            ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"
-        ]
-
-        if file_ext not in supported_extensions:
+        if file_ext not in supported_image_formats:
             raise HTTPException(
                 status_code=400,
-                detail=f"Không hỗ trợ loại tệp {file_ext}. Hỗ trợ các định dạng: {', '.join(supported_extensions)}"
+                detail=f"Không hỗ trợ định dạng hình ảnh {file_ext}. Hỗ trợ các định dạng: {', '.join(supported_image_formats)}"
             )
 
-        # Tạo thư mục tạm thời để lưu tệp
+        # Kiểm tra kích thước file
+        content = await file.read(1024 * 1024 * 10)  # Đọc tối đa 10MB
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Kích thước hình ảnh quá lớn. Giới hạn {MAX_FILE_SIZE / (1024 * 1024):.1f}MB"
+            )
+
+        # Tạo tệp tạm thời
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
             temp_path = temp_file.name
-            content = await file.read()
             temp_file.write(content)
 
-        # Bắt đầu tính thời gian xử lý
-        start_time = time.time()
+        try:
+            # Bắt đầu tính thời gian xử lý
+            start_time = time.time()
 
-        # Sử dụng trình phân tích hình ảnh
-        from app.services.cv_parser.image import ImageParser
-        image_parser = ImageParser()
+            # Sử dụng trình phân tích hình ảnh
+            from app.services.cv_parser.image import ImageParser
+            image_parser = ImageParser()
 
-        # Cải thiện chất lượng hình ảnh cho OCR
-        improved_image_path = image_parser.improve_image_for_ocr(temp_path)
+            # Cải thiện chất lượng hình ảnh cho OCR
+            improved_image_path = image_parser.improve_image_for_ocr(temp_path)
 
-        # Phát hiện loại tài liệu
-        document_type = image_parser.detect_document_type(improved_image_path)
+            # Phát hiện loại tài liệu
+            document_type = image_parser.detect_document_type(improved_image_path)
 
-        if document_type != "cv":
+            if document_type != "cv":
+                return {
+                    "status": "warning",
+                    "message": "Hình ảnh có thể không phải là CV",
+                    "document_type": document_type,
+                    "confidence": 0.5,
+                    "processing_time": time.time() - start_time
+                }
+
+            # Trích xuất thông tin
+            result = image_parser.extract_structured_info(improved_image_path)
+
+            # Trích xuất văn bản
+            text = image_parser.extract_text(improved_image_path)
+
+            # Đánh giá chất lượng hình ảnh
+            quality_info = image_parser.get_image_quality(improved_image_path)
+
+            # Chuyển đổi kết quả thành CVData
+            cv_data = cv_extractor._convert_json_to_cv_data(result, file.filename)
+            cv_data.raw_text = text
+            cv_data.extracted_from_image = True
+
+            # Tính thời gian xử lý
+            processing_time = time.time() - start_time
+
             return {
-                "status": "warning",
-                "message": "Hình ảnh có thể không phải là CV",
+                "status": "success",
+                "message": "CV đã được phân tích thành công",
+                "data": cv_data,
+                "text": text,
+                "quality_info": quality_info,
                 "document_type": document_type,
-                "confidence": 0.5,
-                "processing_time": time.time() - start_time
+                "processing_time": processing_time
             }
 
-        # Trích xuất thông tin
-        result = image_parser.extract_structured_info(improved_image_path)
+        finally:
+            # Xóa tệp tạm thời
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
-        # Trích xuất văn bản
-        text = image_parser.extract_text(improved_image_path)
+            # Xóa tệp cải thiện nếu khác với tệp gốc
+            if improved_image_path != temp_path and os.path.exists(improved_image_path):
+                os.unlink(improved_image_path)
 
-        # Đánh giá chất lượng hình ảnh
-        quality_info = image_parser.get_image_quality(improved_image_path)
-
-        # Chuyển đổi kết quả thành CVData
-        cv_data = cv_extractor._convert_json_to_cv_data(result, file.filename)
-        cv_data.raw_text = text
-        cv_data.extracted_from_image = True
-
-        # Xóa tệp tạm thời
-        os.unlink(temp_path)
-        if improved_image_path != temp_path:
-            os.unlink(improved_image_path)
-
-        # Tính thời gian xử lý
-        processing_time = time.time() - start_time
-
-        return {
-            "status": "success",
-            "message": "CV đã được phân tích thành công",
-            "data": cv_data,
-            "text": text,
-            "quality_info": quality_info,
-            "document_type": document_type,
-            "processing_time": processing_time
-        }
-
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Lỗi khi phân tích CV từ hình ảnh: {str(e)}")
+        logger.error(f"Lỗi khi phân tích CV từ hình ảnh: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Lỗi khi phân tích CV từ hình ảnh: {str(e)}"
         )
+
 
 @router.post("/summarize/{cv_id}", response_model=Dict[str, Any], summary="Tóm tắt CV")
 async def summarize_cv(
@@ -473,7 +659,7 @@ async def summarize_cv(
         cv_data = router.analyzed_cvs[cv_id]
 
         # Sử dụng LLM để tạo tóm tắt
-        from app.services.llm.local_model import LocalLLM
+
         llm = LocalLLM()
 
         # Tạo prompt
